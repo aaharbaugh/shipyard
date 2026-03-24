@@ -195,10 +195,26 @@ The MVP is done when all of the following are true:
 4. Two traceable runs exist with different execution paths.
 5. `PRESEARCH.md` and `CODEAGENT.md` are present and aligned with the implementation.
 
-## Immediate Next Steps
+## Current Completion Snapshot
 
-1. Create the Python project skeleton.
-2. Implement the persistent LangGraph loop with stdin intake.
-3. Use `cgr` as the fixed Code-Graph-RAG operating mode for this repo.
-4. Wire the `cgr`-backed function edit path and keep non-function fallback isolated.
-5. Add graph-readiness checks, context payload support, and tracing around the `cgr` path.
+The repo now includes:
+
+1. A persistent LangGraph loop with stdin intake and resumable sessions.
+2. Local trace writing and session persistence under `.shipyard/`.
+3. Anchor-based fallback edits with verification and rollback.
+4. Named-function editing through a Code-Graph-RAG-gated path using the package's file
+   editor primitives.
+5. Graph status, indexing, artifact inspection, stale detection, and refresh-required
+   metadata.
+6. A sequential helper-planner step that contributes scoped recommendations before the
+   lead agent finalizes the edit plan.
+7. A FastAPI surface for instructions, sessions, git automation, and graph operations.
+
+## Remaining Next Steps
+
+1. Deepen the graph-backed path so blast-radius query results are surfaced more directly
+   in runtime state rather than relying mainly on readiness plus surgical replacement.
+2. Expand the edit vocabulary beyond replacement-oriented flows if the project moves
+   beyond the current MVP scope.
+3. Add richer submission artifacts if required, such as additional trace examples or
+   more formal rebuild evaluation notes.

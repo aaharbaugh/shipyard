@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from langgraph.graph import END, START, StateGraph
 
+from .helper_agent import run_helper_agent
 from .prompts import build_runtime_prompt
 from .proposal import propose_edit
 from .state import ShipyardState
+from .tools.code_graph import inspect_code_graph_status
 from .tools.edit_file import AnchorEditError, apply_anchor_edit, validate_anchor_edit
+from .tools.function_edit import FunctionEditError, apply_function_edit
 from .tools.read_file import read_file
 from .tools.revert import revert_file
 from .tools.snapshot import snapshot_file
@@ -27,17 +30,62 @@ def prepare_prompt(state: ShipyardState) -> dict:
     }
 
 
+def consult_helper_agent(state: ShipyardState) -> dict:
+    helper_result = run_helper_agent(state)
+    context = dict(state.get("context", {}))
+    context["helper_notes"] = helper_result["notes"]
+    return {
+        "context": context,
+        "helper_output": {
+            "helper_agent": helper_result,
+        },
+        "status": "helper_consulted",
+    }
+
+
 def plan_edit(state: ShipyardState) -> dict:
     planned = propose_edit(state)
+    helper_output = dict(state.get("helper_output", {}))
+    helper_output["proposal"] = {
+        "provider": planned.get("provider"),
+        "provider_reason": planned.get("provider_reason"),
+    }
     return {
         "target_path": planned.get("target_path"),
         "anchor": planned.get("anchor"),
         "replacement": planned.get("replacement"),
-        "helper_output": {
-            "provider": planned.get("provider"),
-            "provider_reason": planned.get("provider_reason"),
-        },
+        "edit_mode": planned.get("edit_mode") or state.get("edit_mode") or "anchor",
+        "helper_output": helper_output,
         "status": "planned",
+    }
+
+
+def check_edit_readiness(state: ShipyardState) -> dict:
+    if state.get("edit_mode") != "named_function":
+        return {
+            "code_graph_status": {
+                "ready": False,
+                "available": False,
+                "source": "skipped",
+                "reason": "Code graph readiness is only required for named-function edits.",
+            },
+            "status": "ready_for_file_read",
+        }
+
+    status = inspect_code_graph_status(state.get("target_path"))
+    if not status.get("ready"):
+        return {
+            "code_graph_status": status,
+            "status": "graph_unavailable",
+            "error": (
+                "Named-function edits require a ready Code-Graph-RAG runtime. "
+                f"{status.get('reason', 'Code graph is unavailable.')}"
+            ),
+        }
+
+    return {
+        "code_graph_status": status,
+        "status": "ready_for_file_read",
     }
 
 
@@ -53,6 +101,47 @@ def read_target_file(state: ShipyardState) -> dict:
 
 
 def apply_edit(state: ShipyardState) -> dict:
+    if state.get("edit_mode") == "named_function":
+        target_path = state.get("target_path")
+        function_name = state.get("context", {}).get("function_name")
+        replacement = state.get("replacement")
+        edit_attempts = state.get("edit_attempts", 0) + 1
+        code_graph_status = dict(state.get("code_graph_status", {}))
+
+        if not target_path or not function_name or replacement is None:
+            return {
+                "edit_applied": False,
+                "edit_attempts": edit_attempts,
+                "status": "awaiting_edit_spec",
+                "error": "Missing target path, function name, or replacement.",
+            }
+
+        snapshot_path = snapshot_file(target_path)
+        try:
+            apply_function_edit(target_path, function_name, replacement)
+        except FunctionEditError as exc:
+            return {
+                "edit_applied": False,
+                "edit_attempts": edit_attempts,
+                "snapshot_path": snapshot_path,
+                "status": "edit_blocked",
+                "error": str(exc),
+            }
+
+        index_state = dict(code_graph_status.get("index_state", {}))
+        index_state["stale"] = True
+        code_graph_status["index_state"] = index_state
+        code_graph_status["refresh_required"] = True
+        code_graph_status["reason"] = "Graph-backed function edit succeeded; re-index to refresh graph state."
+
+        return {
+            "edit_applied": True,
+            "edit_attempts": edit_attempts,
+            "snapshot_path": snapshot_path,
+            "code_graph_status": code_graph_status,
+            "status": "edited",
+        }
+
     target_path = state.get("target_path")
     anchor = state.get("anchor")
     replacement = state.get("replacement")
@@ -145,19 +234,36 @@ def should_retry(state: ShipyardState) -> str:
     return "done"
 
 
+def should_continue_after_readiness(state: ShipyardState) -> str:
+    if state.get("status") == "ready_for_file_read":
+        return "continue"
+    return "done"
+
+
 def build_graph():
     graph = StateGraph(ShipyardState)
     graph.add_node("seed_defaults", seed_defaults)
     graph.add_node("prepare_prompt", prepare_prompt)
+    graph.add_node("consult_helper_agent", consult_helper_agent)
     graph.add_node("plan_edit", plan_edit)
+    graph.add_node("check_edit_readiness", check_edit_readiness)
     graph.add_node("read_target_file", read_target_file)
     graph.add_node("apply_edit", apply_edit)
     graph.add_node("verify_edit", verify_edit)
     graph.add_node("recover_or_finish", recover_or_finish)
     graph.add_edge(START, "seed_defaults")
     graph.add_edge("seed_defaults", "prepare_prompt")
-    graph.add_edge("prepare_prompt", "plan_edit")
-    graph.add_edge("plan_edit", "read_target_file")
+    graph.add_edge("prepare_prompt", "consult_helper_agent")
+    graph.add_edge("consult_helper_agent", "plan_edit")
+    graph.add_edge("plan_edit", "check_edit_readiness")
+    graph.add_conditional_edges(
+        "check_edit_readiness",
+        should_continue_after_readiness,
+        {
+            "continue": "read_target_file",
+            "done": END,
+        },
+    )
     graph.add_edge("read_target_file", "apply_edit")
     graph.add_edge("apply_edit", "verify_edit")
     graph.add_edge("verify_edit", "recover_or_finish")

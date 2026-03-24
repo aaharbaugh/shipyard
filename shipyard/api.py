@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from .graph import build_graph
 from .main import _normalize_payload, run_once
 from .session_store import SessionStore
+from .tools.code_graph import index_code_graph, inspect_code_graph_status
 from .tools.git_tools import GitAutomation, GitAutomationError
 
 
@@ -19,6 +20,7 @@ class InstructionRequest(BaseModel):
     replacement: str | None = None
     proposal_mode: str | None = None
     proposal_model: str | None = None
+    edit_mode: str | None = None
     context: dict[str, Any] = Field(default_factory=dict)
     verification_commands: list[str] = Field(default_factory=list)
     edit_attempts: int = 0
@@ -32,6 +34,11 @@ class GitBranchRequest(BaseModel):
 class GitCommitRequest(BaseModel):
     message: str
     paths: list[str] = Field(default_factory=list)
+
+
+class GraphIndexRequest(BaseModel):
+    workdir: str | None = None
+    output_dir: str | None = None
 
 
 app = FastAPI(title="Shipyard MVP API")
@@ -62,6 +69,19 @@ def get_session(session_id: str) -> dict[str, Any]:
 def instruct(request: InstructionRequest) -> dict[str, Any]:
     state = _normalize_payload(request.model_dump())
     return run_once(graph_app, session_store, state)
+
+
+@app.get("/graph/status")
+def graph_status() -> dict[str, Any]:
+    return inspect_code_graph_status()
+
+
+@app.post("/graph/index")
+def graph_index(request: GraphIndexRequest) -> dict[str, Any]:
+    result = index_code_graph(request.workdir, request.output_dir)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result)
+    return result
 
 
 @app.get("/git/status")

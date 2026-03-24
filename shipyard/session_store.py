@@ -23,10 +23,13 @@ class SessionStore:
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "instruction": state.get("instruction"),
             "status": state.get("status"),
+            "edit_mode": state.get("edit_mode"),
             "target_path": state.get("target_path"),
             "error": state.get("error"),
             "trace_path": state.get("trace_path"),
             "snapshot_path": state.get("snapshot_path"),
+            "code_graph_ready": state.get("code_graph_status", {}).get("ready"),
+            "code_graph_refresh_required": state.get("code_graph_status", {}).get("refresh_required"),
         }
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
@@ -54,6 +57,8 @@ class SessionStore:
                         "session_id": session_dir.name,
                         "status": latest.get("status"),
                         "instruction": latest.get("instruction"),
+                        "edit_mode": latest.get("edit_mode"),
+                        "code_graph_refresh_required": latest.get("code_graph_status", {}).get("refresh_required"),
                     }
                 )
         return sessions

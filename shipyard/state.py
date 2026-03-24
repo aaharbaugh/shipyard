@@ -10,6 +10,7 @@ class RuntimeContext(TypedDict, total=False):
     search_text: str
     replace_text: str
     helper_notes: str
+    function_name: str
 
 
 class ShipyardState(TypedDict, total=False):
@@ -20,10 +21,12 @@ class ShipyardState(TypedDict, total=False):
     replacement: str
     proposal_mode: str
     proposal_model: str
+    edit_mode: str
     context: RuntimeContext
     verification_commands: list[str]
     prompt: str
     helper_output: dict[str, Any]
+    code_graph_status: dict[str, Any]
     file_before: str
     snapshot_path: str
     reverted_to_snapshot: bool

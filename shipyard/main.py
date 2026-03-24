@@ -23,6 +23,28 @@ def parse_user_input(raw: str) -> ShipyardState:
     return {"instruction": text, "context": {}}
 
 
+def read_user_input() -> str:
+    first_line = input("> ")
+    stripped = first_line.strip()
+
+    if stripped.lower() in {"exit", "quit"}:
+        return stripped
+
+    if not stripped.startswith("{"):
+        return first_line
+
+    lines = [first_line]
+    while True:
+        try:
+            json.loads("\n".join(lines).strip())
+            return "\n".join(lines)
+        except json.JSONDecodeError:
+            next_line = input("... ")
+            if not next_line.strip():
+                return "\n".join(lines)
+            lines.append(next_line)
+
+
 def _normalize_payload(payload: dict[str, Any]) -> ShipyardState:
     return {
         "session_id": str(payload.get("session_id", "")).strip() or None,
@@ -32,6 +54,7 @@ def _normalize_payload(payload: dict[str, Any]) -> ShipyardState:
         "replacement": _coerce_optional_str(payload.get("replacement")),
         "proposal_mode": _coerce_optional_str(payload.get("proposal_mode")),
         "proposal_model": _coerce_optional_str(payload.get("proposal_model")),
+        "edit_mode": _coerce_optional_str(payload.get("edit_mode")),
         "context": payload.get("context", {}) or {},
         "edit_attempts": int(payload.get("edit_attempts", 0) or 0),
         "max_edit_attempts": int(payload.get("max_edit_attempts", 2) or 2),
@@ -80,12 +103,18 @@ def main() -> None:
             print("resume_requested_but_no_saved_state_found")
 
     while True:
-        raw = input("> ")
+        raw = read_user_input()
         if raw.strip().lower() in {"exit", "quit"}:
             print("Stopping Shipyard MVP runner.")
             return
 
-        state = parse_user_input(raw)
+        try:
+            state = parse_user_input(raw)
+        except json.JSONDecodeError as exc:
+            print(f"input_error=Invalid JSON: {exc.msg} at line {exc.lineno} column {exc.colno}")
+            print("hint=Paste the full JSON block, then press Enter on a blank line.")
+            continue
+
         state["session_id"] = state.get("session_id") or session_id
         result = run_once(app, session_store, state)
         _print_result(result)

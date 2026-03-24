@@ -17,7 +17,11 @@ def build_runtime_prompt(state: ShipyardState) -> str:
         sections.append("Injected context:")
         sections.extend(_format_context(context))
 
-    if state.get("anchor"):
+    edit_mode = state.get("edit_mode")
+    if edit_mode == "named_function":
+        function_name = context.get("function_name") or "unknown"
+        sections.append(f"Editing mode: named-function replacement for {function_name}.")
+    elif state.get("anchor"):
         sections.append("Editing mode: anchor-based replacement.")
 
     return "\n".join(sections).strip()
@@ -43,7 +47,15 @@ def build_proposal_prompt(state: ShipyardState) -> str:
 
 def _format_context(context: RuntimeContext) -> list[str]:
     lines: list[str] = []
-    for key in ("spec_note", "test_failure", "file_hint", "search_text", "replace_text", "helper_notes"):
+    for key in (
+        "spec_note",
+        "test_failure",
+        "file_hint",
+        "search_text",
+        "replace_text",
+        "helper_notes",
+        "function_name",
+    ):
         value = context.get(key)
         if value:
             lines.append(f"- {key}: {value}")

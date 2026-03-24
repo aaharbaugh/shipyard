@@ -76,6 +76,7 @@ def _openai_or_fallback(state: ShipyardState) -> dict[str, Any]:
         "target_path": parsed.get("target_path") or state.get("target_path") or state.get("context", {}).get("file_hint"),
         "anchor": parsed.get("anchor"),
         "replacement": parsed.get("replacement"),
+        "edit_mode": "named_function" if state.get("context", {}).get("function_name") else "anchor",
         "provider": "openai",
         "provider_reason": f"OpenAI model {model} generated proposal.",
     }
@@ -99,6 +100,11 @@ def _heuristic_proposal(state: ShipyardState) -> dict[str, Any]:
     anchor = state.get("anchor")
     replacement = state.get("replacement")
     notes: list[str] = []
+    edit_mode = "anchor"
+
+    if context.get("function_name"):
+        edit_mode = "named_function"
+        notes.append("Using named-function edit mode from injected context.")
 
     if anchor and replacement is not None:
         notes.append("Edit spec already provided by caller.")
@@ -121,6 +127,7 @@ def _heuristic_proposal(state: ShipyardState) -> dict[str, Any]:
         "target_path": target_path,
         "anchor": anchor,
         "replacement": replacement,
+        "edit_mode": edit_mode,
         "provider": "heuristic",
         "provider_reason": "; ".join(notes) if notes else "No heuristic edit proposal could be derived.",
     }
