@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from ..storage_paths import GRAPH_INDEX_ROOT
+from ..workspaces import get_live_graph_runtime_root
 
-DEFAULT_PROTO_DIR = Path(".shipyard") / "code_graph"
+DEFAULT_PROTO_DIR = GRAPH_INDEX_ROOT
 
 
-def inspect_code_graph_status(workdir: str | None = None) -> dict[str, Any]:
+def inspect_code_graph_status(workdir: str | None = None, include_debug: bool = False) -> dict[str, Any]:
     normalized_workdir = _normalize_workdir(workdir)
     if _truthy_env("SHIPYARD_ASSUME_CODE_GRAPH_READY"):
         return {
@@ -21,6 +25,12 @@ def inspect_code_graph_status(workdir: str | None = None) -> dict[str, Any]:
             "source": "env_override",
             "reason": "SHIPYARD_ASSUME_CODE_GRAPH_READY is enabled.",
             "index_state": inspect_code_graph_artifacts(normalized_workdir),
+            "live_graph_state": {
+                "connected": True,
+                "node_count": None,
+                "relationship_count": None,
+                "populated": True,
+            },
         }
 
     executable = _find_cgr_executable()
@@ -31,12 +41,19 @@ def inspect_code_graph_status(workdir: str | None = None) -> dict[str, Any]:
             "source": "cli_lookup",
             "reason": "Code-Graph-RAG CLI `cgr` was not found.",
             "index_state": inspect_code_graph_artifacts(normalized_workdir),
+            "live_graph_state": {
+                "connected": False,
+                "node_count": None,
+                "relationship_count": None,
+                "populated": False,
+            },
         }
 
     index_state = inspect_code_graph_artifacts(normalized_workdir)
     completed = subprocess.run(
         [executable, "stats"],
-        cwd=normalized_workdir,
+        cwd=_cgr_run_dir(),
+        env=_cgr_env(),
         text=True,
         capture_output=True,
         check=False,
@@ -47,25 +64,46 @@ def inspect_code_graph_status(workdir: str | None = None) -> dict[str, Any]:
         if isinstance(part, str) and part.strip()
     ).strip()
 
-    if completed.returncode == 0:
-        return {
+    live_graph_state = _parse_live_graph_state(combined_output, completed.returncode)
+
+    if completed.returncode == 0 and live_graph_state["populated"]:
+        result = {
             "ready": True,
             "available": True,
             "source": "cgr_stats",
             "reason": "Code graph statistics are available.",
             "index_state": index_state,
-            "details": combined_output,
+            "live_graph_state": live_graph_state,
         }
+        if include_debug and combined_output:
+            result["details"] = combined_output
+        return result
 
-    return {
+    if completed.returncode == 0:
+        result = {
+            "ready": False,
+            "available": True,
+            "source": "cgr_stats",
+            "reason": "Memgraph is reachable, but the live graph is still empty.",
+            "index_state": index_state,
+            "live_graph_state": live_graph_state,
+        }
+        if include_debug and combined_output:
+            result["details"] = combined_output
+        return result
+
+    result = {
         "ready": False,
         "available": True,
         "source": "cgr_stats",
         "reason": _summarize_failure(combined_output),
         "index_state": index_state,
-        "details": combined_output,
+        "live_graph_state": live_graph_state,
         "returncode": completed.returncode,
     }
+    if include_debug and combined_output:
+        result["details"] = combined_output
+    return result
 
 
 def inspect_code_graph_artifacts(workdir: str | None = None) -> dict[str, Any]:
@@ -93,6 +131,7 @@ def inspect_code_graph_artifacts(workdir: str | None = None) -> dict[str, Any]:
 def index_code_graph(
     workdir: str | None = None,
     output_dir: str | None = None,
+    include_debug: bool = False,
 ) -> dict[str, Any]:
     executable = _find_cgr_executable()
     root = _normalize_workdir(workdir)
@@ -115,7 +154,8 @@ def index_code_graph(
             "--output-proto-dir",
             str(proto_dir),
         ],
-        cwd=root,
+        cwd=_cgr_run_dir(),
+        env=_cgr_env(),
         text=True,
         capture_output=True,
         check=False,
@@ -126,13 +166,67 @@ def index_code_graph(
         if isinstance(part, str) and part.strip()
     ).strip()
 
-    return {
+    result = {
         "ok": completed.returncode == 0,
         "reason": "Code graph index created." if completed.returncode == 0 else _summarize_failure(combined_output),
         "returncode": completed.returncode,
-        "output": combined_output,
         "index_state": inspect_code_graph_artifacts(str(root)),
     }
+    if include_debug and combined_output:
+        result["output"] = combined_output
+    return result
+
+
+def sync_live_code_graph(
+    workdir: str | None = None,
+    clean: bool = False,
+    include_debug: bool = False,
+) -> dict[str, Any]:
+    executable = _find_cgr_executable()
+    root = _normalize_workdir(workdir)
+    if executable is None:
+        return {
+            "ok": False,
+            "reason": "Code-Graph-RAG CLI `cgr` was not found.",
+            "index_state": inspect_code_graph_artifacts(str(root)),
+        }
+
+    command = [
+        executable,
+        "start",
+        "--repo-path",
+        str(root),
+        "--update-graph",
+    ]
+    if clean:
+        command.append("--clean")
+
+    completed = subprocess.run(
+        command,
+        cwd=_cgr_run_dir(),
+        env=_cgr_env(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    combined_output = "\n".join(
+        part.strip()
+        for part in (completed.stdout, completed.stderr)
+        if isinstance(part, str) and part.strip()
+    ).strip()
+    status = inspect_code_graph_status(str(root), include_debug=include_debug)
+
+    result = {
+        "ok": completed.returncode == 0,
+        "reason": "Live code graph synchronized." if completed.returncode == 0 else _summarize_failure(combined_output),
+        "returncode": completed.returncode,
+        "index_state": status.get("index_state", inspect_code_graph_artifacts(str(root))),
+        "live_graph_state": status.get("live_graph_state", {}),
+        "ready": status.get("ready", False),
+    }
+    if include_debug and combined_output:
+        result["output"] = combined_output
+    return result
 
 
 def _find_cgr_executable() -> str | None:
@@ -140,6 +234,47 @@ def _find_cgr_executable() -> str | None:
     if local_candidate.exists():
         return str(local_candidate)
     return shutil.which("cgr")
+
+
+def _cgr_env() -> dict[str, str]:
+    env = dict(os.environ)
+    env.pop("OPENAI_API_KEY", None)
+    env.pop("OPENAI_MODEL", None)
+    return env
+
+
+def _cgr_run_dir() -> str:
+    return str(get_live_graph_runtime_root().resolve())
+
+
+def _parse_live_graph_state(output: str, returncode: int) -> dict[str, Any]:
+    clean_output = _strip_ansi(output)
+    node_count = _extract_total_count(clean_output, "Total Nodes")
+    relationship_count = _extract_total_count(clean_output, "Total Relationships")
+    populated = False
+    if node_count is not None:
+        populated = node_count > 0
+    elif relationship_count is not None:
+        populated = relationship_count > 0
+
+    return {
+        "connected": returncode == 0,
+        "node_count": node_count,
+        "relationship_count": relationship_count,
+        "populated": populated,
+    }
+
+
+def _extract_total_count(output: str, label: str) -> int | None:
+    pattern = rf"{label}\s*[^\d]*(\d+)"
+    match = re.search(pattern, output, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _strip_ansi(text: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def _summarize_failure(output: str) -> str:

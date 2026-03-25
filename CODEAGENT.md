@@ -38,7 +38,10 @@ hard-gate MVP requirements from the PRD over broader platform ambitions.
   - edit attempt count
   - verification output
   - trace metadata
-- Session history is stored locally under `.shipyard/sessions/<session_id>/`
+- The runtime also emits grouped sections for `request`, `plan`, `execution`,
+  `verification`, `graph`, and `artifacts` so the API and workbench can render one
+  coherent view of a run.
+- Session history is stored locally under `.shipyard/data/sessions/<session_id>/`
 - The same core run path is exposed through stdin and a FastAPI endpoint
 
 ### Entry Conditions
@@ -62,7 +65,8 @@ the graph is available and a replacement function body is provided, Shipyard use
 Code-Graph-RAG file editor primitives for surgical replacement. If verification fails
 after a write, the failure output is injected back into the next attempt so the agent
 can repair the edit or pause for human intervention. The MVP also reverts the file
-from the latest snapshot before returning a failed status.
+from the latest snapshot before returning a failed status. Ambiguous or blocked runs
+now include a `human_gate` payload so the UI can show the next operator action.
 
 ## File Editing Strategy (MVP)
 
@@ -136,6 +140,8 @@ much easier.
 
 - LangGraph remains the orchestration framework because the project needed explicit
   state transitions, retries, and a persistent local loop more than autonomous breadth.
+- Proposal planning is now split into intent parsing, target resolution, provider
+  generation, and validation instead of one monolithic planner.
 - The stdin runner stayed as the primary local entrypoint, with FastAPI added in
   parallel for testability and programmatic control.
 - Snapshot-before-write and rollback remained mandatory. This preserved a narrow safety

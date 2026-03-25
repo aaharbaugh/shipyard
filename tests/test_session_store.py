@@ -14,15 +14,36 @@ class SessionStoreTests(unittest.TestCase):
                 "session_id": "abc123",
                 "instruction": "demo",
                 "status": "verified",
-                "trace_path": ".shipyard/traces/demo.json",
+                "edit_mode": "named_function",
+                "changed_files": ["/tmp/demo.py"],
+                "content_hash": "abc123",
+                "trace_path": ".shipyard/data/traces/demo.json",
+                "proposal_summary": {
+                    "provider": "openai",
+                    "is_valid": True,
+                },
+                "code_graph_status": {
+                    "ready": True,
+                    "refresh_required": True,
+                },
             }
 
             session_dir = store.append_run(state)
             loaded = store.load_latest_state("abc123")
+            sessions = store.list_sessions()
 
             self.assertTrue(session_dir.endswith("abc123"))
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["status"], "verified")
+            self.assertEqual(loaded["edit_mode"], "named_function")
+            self.assertEqual(loaded["proposal_summary"]["provider"], "openai")
+            self.assertTrue(loaded["code_graph_status"]["refresh_required"])
+            self.assertEqual(sessions[0]["edit_mode"], "named_function")
+            self.assertEqual(sessions[0]["changed_files"], ["/tmp/demo.py"])
+            self.assertEqual(sessions[0]["content_hash"], "abc123")
+            self.assertEqual(sessions[0]["proposal_provider"], "openai")
+            self.assertTrue(sessions[0]["proposal_valid"])
+            self.assertTrue(sessions[0]["code_graph_refresh_required"])
 
 
 if __name__ == "__main__":

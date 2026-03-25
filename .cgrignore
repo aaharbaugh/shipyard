@@ -1,0 +1,10 @@
+.shipyard
+.venv
+.git
+node_modules
+.cgr-hash-cache.json
+.env
+.env.example
+PRESEARCH (2).md:Zone.Identifier
+.env - Copy.example:Zone.Identifier
+shipyard_prd.pdf:Zone.Identifier

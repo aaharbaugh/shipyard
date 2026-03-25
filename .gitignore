@@ -2,5 +2,7 @@
 .shipyard/
 __pycache__/
 *.pyc
+.env
+.shipyard/assistant_session_prompt_log.md
 *.Zone.Identifier
 *:*Zone.Identifier

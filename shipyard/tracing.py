@@ -4,12 +4,12 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from .storage_paths import TRACES_ROOT, ensure_dir
 from .state import ShipyardState
 
 
 def write_trace(state: ShipyardState) -> str:
-    trace_dir = Path(".shipyard") / "traces"
-    trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir = ensure_dir(TRACES_ROOT)
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = state.get("session_id", "unknown")
