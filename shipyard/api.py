@@ -1096,13 +1096,6 @@ Shift+Enter adds a new line.'></textarea>
       if (!job?.job_id) return;
       appendActivityMessages([
         {
-          id: `user-${job.job_id}`,
-          role: "user",
-          label: "You",
-          text: instruction || "Submitted instruction",
-          meta: [],
-        },
-        {
           id: `assistant-${job.job_id}`,
           role: "assistant",
           label: "Shipyard",
@@ -1190,6 +1183,21 @@ Shift+Enter adds a new line.'></textarea>
           existing[index] = message;
         } else {
           existing.push(message);
+        }
+      }
+      saveState({activityMessages: existing});
+      renderActivityStream(existing);
+    }
+
+    function replaceActivityMessageIds(replacements) {
+      const existing = Array.isArray(uiState.activityMessages) ? [...uiState.activityMessages] : [];
+      for (const replacement of replacements) {
+        const fromId = replacement?.fromId;
+        const toMessage = replacement?.toMessage;
+        if (!fromId || !toMessage?.id) continue;
+        const index = existing.findIndex((item) => item.id === fromId);
+        if (index >= 0) {
+          existing[index] = toMessage;
         }
       }
       saveState({activityMessages: existing});
@@ -1762,19 +1770,34 @@ Shift+Enter adds a new line.'></textarea>
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
         });
-      const resolvedSessionId = data?.session_id || sessionId;
-      const jobId = data?.job_id || data?.queue_job?.job_id || null;
-      document.getElementById("session_id").value = resolvedSessionId;
-      appendActivityMessages([
-        {
-          id: `user-${jobId || resolvedSessionId}`,
-          role: "user",
-          label: "You",
-          text: payload.instruction,
-          meta: [],
-        },
-      ]);
-      if (jobId) {
+        const resolvedSessionId = data?.session_id || sessionId;
+        const jobId = data?.job_id || data?.queue_job?.job_id || null;
+        document.getElementById("session_id").value = resolvedSessionId;
+        if (jobId) {
+          replaceActivityMessageIds([
+            {
+              fromId: `user-pending-${sessionId}`,
+              toMessage: {
+                id: `user-${jobId}`,
+                role: "user",
+                label: "You",
+                text: payload.instruction,
+                meta: [],
+              },
+            },
+            {
+              fromId: `assistant-pending-${sessionId}`,
+              toMessage: {
+                id: `assistant-${jobId}`,
+                role: "assistant",
+                label: "Shipyard",
+                text: "Queued.",
+                badge: "Queued",
+                badgeTone: "neutral",
+                meta: [],
+              },
+            },
+          ]);
           const queueJob = data?.queue_job || {
             job_id: jobId,
             session_id: resolvedSessionId,

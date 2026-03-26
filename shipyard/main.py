@@ -94,6 +94,15 @@ def run_once(
     if spec_bundle.get("created") or spec_bundle.get("mode"):
         state["spec_bundle"] = spec_bundle
     action_plan = plan_actions(state)
+    if not action_plan.get("is_valid", True):
+        result = _invalid_action_plan_result(state, action_plan)
+        result = _sanitize_runtime_result(result)
+        trace_path = write_trace(result)
+        result["trace_path"] = trace_path
+        result = enrich_state_sections(result)
+        session_store.append_run(result)
+        _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": trace_path})
+        return result
     result = _run_action_plan(app, state, action_plan, progress_callback)
     if spec_bundle:
         result["spec_bundle"] = spec_bundle
@@ -180,6 +189,26 @@ def _ensure_session_id(value: Any) -> str:
     if not text or text.lower() == "none":
         return uuid.uuid4().hex[:8]
     return text
+
+
+def _invalid_action_plan_result(state: ShipyardState, action_plan: dict[str, Any]) -> ShipyardState:
+    errors = list(action_plan.get("validation_errors", []) or [])
+    message = "Action plan was incomplete or invalid."
+    if errors:
+        message = f"{message} {' '.join(errors)}"
+    return {
+        **state,
+        "status": "invalid_action_plan",
+        "error": message,
+        "action_plan": action_plan,
+        "human_gate": {
+            "status": "blocked",
+            "reason": message,
+            "action": "clarify_request",
+            "prompt": "Clarify the missing files or steps, then run again.",
+            "details": {"validation_errors": errors},
+        },
+    }
 
 
 def _maybe_sync_graph(state: ShipyardState) -> dict[str, Any] | None:

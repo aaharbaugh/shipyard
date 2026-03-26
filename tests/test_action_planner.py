@@ -3,10 +3,24 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from shipyard.action_planner import plan_actions
+from shipyard.action_planner import _build_action_plan_prompt, plan_actions
 
 
 class ActionPlannerTests(unittest.TestCase):
+    def test_action_plan_prompt_lists_explicit_files(self) -> None:
+        prompt = _build_action_plan_prompt(
+            {
+                "instruction": "Create a tiny Python repo with main.py, math_utils.py, formatter.py, and config.json",
+                "session_id": "demo",
+            }
+        )
+
+        self.assertIn("Explicit files mentioned by the user:", prompt)
+        self.assertIn("main.py", prompt)
+        self.assertIn("math_utils.py", prompt)
+        self.assertIn("formatter.py", prompt)
+        self.assertIn("config.json", prompt)
+
     def test_heuristic_action_plan_splits_into_multiple_actions(self) -> None:
         result = plan_actions(
             {
@@ -140,6 +154,34 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertIn("scratch_copy_9.py", result["actions"][0]["target_path"])
         self.assertIn("random_algorithm", result["actions"][0]["replacement"])
         self.assertEqual(result["actions"][0]["edit_mode"], "append")
+
+    def test_openai_action_plan_marks_explicit_file_scaffold_incomplete_when_files_are_missing(self) -> None:
+        mock_response = Mock()
+        mock_response.json.return_value = {
+            "output_text": '{"actions":[{"instruction":"write main.py","edit_mode":"write_file","target_path":"main.py","replacement":"print(\\"hi\\")\\n"}]}'
+        }
+        mock_response.raise_for_status.return_value = None
+
+        mock_client = Mock()
+        mock_client.__enter__ = Mock(return_value=mock_client)
+        mock_client.__exit__ = Mock(return_value=None)
+        mock_client.post.return_value = mock_response
+
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
+            "shipyard.action_planner.httpx.Client",
+            return_value=mock_client,
+        ):
+            result = plan_actions(
+                {
+                    "instruction": "Create a tiny repo with main.py, math_utils.py, formatter.py, and config.json",
+                    "proposal_mode": "openai",
+                    "session_id": "demo",
+                    "context": {"testing_mode": True},
+                }
+            )
+
+        self.assertFalse(result["is_valid"])
+        self.assertTrue(any("math_utils.py" in error for error in result["validation_errors"]))
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from shipyard.main import _maybe_sync_graph, _run_action_plan, _should_skip_graph_sync, main, parse_user_input, read_user_input
+from shipyard.main import _maybe_sync_graph, _run_action_plan, _should_skip_graph_sync, main, parse_user_input, read_user_input, run_once
 from shipyard.main import _attach_file_outcome
 
 
@@ -77,6 +77,15 @@ class MainInputTests(unittest.TestCase):
             side_effect=["replace \"a\" with \"b\"", "exit"],
         ), patch("shipyard.main.build_graph", return_value=fake_app), patch(
             "shipyard.main.SessionStore", return_value=fake_store
+        ), patch(
+            "shipyard.main.plan_actions",
+            return_value={
+                "actions": [{"instruction": "replace \"a\" with \"b\"", "valid": True}],
+                "provider": "heuristic",
+                "provider_reason": "test",
+                "is_valid": True,
+                "validation_errors": [],
+            },
         ), patch(
             "shipyard.main.write_trace", return_value=".shipyard/data/traces/demo.json"
         ), redirect_stdout(output):
@@ -156,6 +165,37 @@ class MainInputTests(unittest.TestCase):
         self.assertEqual(app.invoke.call_count, 2)
         self.assertEqual(result["changed_files"], ["/tmp/file1.txt", "/tmp/file2.txt"])
         self.assertEqual(result["instruction_steps"], ["create 2 files", "write hello"])
+
+    def test_run_once_short_circuits_invalid_action_plan(self) -> None:
+        app = Mock()
+        session_store = Mock()
+
+        with patch("shipyard.main.PromptLog") as prompt_log_cls, patch(
+            "shipyard.main.generate_spec_bundle",
+            return_value={"mode": "direct_edit", "created": False},
+        ), patch(
+            "shipyard.main.plan_actions",
+            return_value={
+                "actions": [{"instruction": "write main.py", "valid": True}],
+                "provider": "openai",
+                "provider_reason": "planned",
+                "is_valid": False,
+                "validation_errors": ["Action plan did not cover all explicitly named files: config.json."],
+            },
+        ):
+            prompt_log_cls.return_value.append = Mock()
+            result = run_once(
+                app,
+                session_store,
+                {
+                    "session_id": "demo",
+                    "instruction": "Create a tiny repo with main.py and config.json",
+                },
+            )
+
+        app.invoke.assert_not_called()
+        self.assertEqual(result["status"], "invalid_action_plan")
+        self.assertIn("config.json", result["error"])
 
 
 if __name__ == "__main__":

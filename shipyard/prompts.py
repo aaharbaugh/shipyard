@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .planning_hints import extract_explicit_filenames
 from .repo_context import build_repo_context_lines
 from .state import RuntimeContext, ShipyardState
 
@@ -50,6 +51,7 @@ def build_proposal_prompt(state: ShipyardState) -> str:
     context = state.get("context", {})
     helper_output = state.get("helper_output", {})
     code_graph_status = state.get("code_graph_status", {})
+    explicit_files = extract_explicit_filenames(state.get("instruction", ""))
     lines = [
         "Return only JSON with keys: target_path, anchor, replacement, edit_mode, copy_count, quantity.",
         "Supported edit_mode values are: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, rename_symbol.",
@@ -61,6 +63,10 @@ def build_proposal_prompt(state: ShipyardState) -> str:
     if context:
         lines.append("Injected context:")
         lines.extend(_format_context(context))
+
+    if explicit_files:
+        lines.append("Explicit files mentioned by the user:")
+        lines.extend(f"- {name}" for name in explicit_files)
 
     lines.append("Lightweight repository context:")
     lines.extend(f"- {line}" for line in build_repo_context_lines(state.get("session_id"), state.get("target_path")))

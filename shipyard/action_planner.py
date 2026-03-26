@@ -6,8 +6,10 @@ from typing import Any
 
 import httpx
 
+from .action_plan_validation import validate_action_plan
 from .actions import Action, build_action_fallback, normalize_action
 from .intent_parser import split_instruction_steps
+from .planning_hints import extract_explicit_filenames
 from .repo_context import build_repo_context_lines
 from .state import ShipyardState
 
@@ -40,10 +42,13 @@ def _heuristic_action_plan(state: ShipyardState) -> dict[str, Any]:
                 provider_reason="Derived action sequence from instruction text.",
             )
         )
+    validation_errors = validate_action_plan(state.get("instruction", ""), actions)
     return {
         "actions": actions,
         "provider": "heuristic",
         "provider_reason": "Derived action sequence from instruction text.",
+        "is_valid": not validation_errors,
+        "validation_errors": validation_errors,
     }
 
 
@@ -69,17 +74,21 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
             )
             response.raise_for_status()
     except Exception as exc:
+        actions = [
+            normalize_action(
+                {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                fallback={},
+                provider="openai",
+                provider_reason=f"OpenAI action planning failed: {exc}",
+            )
+        ]
+        validation_errors = validate_action_plan(state.get("instruction", ""), actions)
         return {
-            "actions": [
-                normalize_action(
-                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
-                    fallback={},
-                    provider="openai",
-                    provider_reason=f"OpenAI action planning failed: {exc}",
-                )
-            ],
+            "actions": actions,
             "provider": "openai",
             "provider_reason": f"OpenAI action planning failed: {exc}",
+            "is_valid": False,
+            "validation_errors": validation_errors,
         }
 
     body = response.json()
@@ -87,32 +96,40 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
     try:
         parsed = json.loads(output_text)
     except json.JSONDecodeError:
+        actions = [
+            normalize_action(
+                {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                fallback={},
+                provider="openai",
+                provider_reason="OpenAI action plan response was not valid JSON.",
+            )
+        ]
+        validation_errors = validate_action_plan(state.get("instruction", ""), actions)
         return {
-            "actions": [
-                normalize_action(
-                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
-                    fallback={},
-                    provider="openai",
-                    provider_reason="OpenAI action plan response was not valid JSON.",
-                )
-            ],
+            "actions": actions,
             "provider": "openai",
             "provider_reason": "OpenAI action plan response was not valid JSON.",
+            "is_valid": False,
+            "validation_errors": validation_errors,
         }
 
     actions = parsed.get("actions")
     if not isinstance(actions, list) or not actions:
+        actions = [
+            normalize_action(
+                {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                fallback={},
+                provider="openai",
+                provider_reason="OpenAI action plan response did not include actions.",
+            )
+        ]
+        validation_errors = validate_action_plan(state.get("instruction", ""), actions)
         return {
-            "actions": [
-                normalize_action(
-                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
-                    fallback={},
-                    provider="openai",
-                    provider_reason="OpenAI action plan response did not include actions.",
-                )
-            ],
+            "actions": actions,
             "provider": "openai",
             "provider_reason": "OpenAI action plan response did not include actions.",
+            "is_valid": False,
+            "validation_errors": validation_errors,
         }
 
     normalized: list[Action] = []
@@ -142,27 +159,35 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
             )
         )
     if not normalized:
+        actions = [
+            normalize_action(
+                {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                fallback={},
+                provider="openai",
+                provider_reason="OpenAI action plan response could not be normalized.",
+            )
+        ]
+        validation_errors = validate_action_plan(state.get("instruction", ""), actions)
         return {
-            "actions": [
-                normalize_action(
-                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
-                    fallback={},
-                    provider="openai",
-                    provider_reason="OpenAI action plan response could not be normalized.",
-                )
-            ],
+            "actions": actions,
             "provider": "openai",
             "provider_reason": "OpenAI action plan response could not be normalized.",
+            "is_valid": False,
+            "validation_errors": validation_errors,
         }
+    validation_errors = validate_action_plan(state.get("instruction", ""), normalized)
     return {
         "actions": normalized,
         "provider": "openai",
         "provider_reason": f"OpenAI model {model} produced action plan.",
+        "is_valid": not validation_errors,
+        "validation_errors": validation_errors,
     }
 
 
 def _build_action_plan_prompt(state: ShipyardState) -> str:
     instruction = state.get("instruction", "").strip()
+    explicit_files = extract_explicit_filenames(instruction)
     lines = [
         "Return only JSON.",
         "Plan the user request as an ordered list of actions.",
@@ -171,12 +196,20 @@ def _build_action_plan_prompt(state: ShipyardState) -> str:
         "Allowed edit_mode values: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, rename_symbol.",
         "Do not omit separate steps just because they appear in one sentence.",
         "If the user explicitly names a file, preserve that exact file as target_path instead of inventing a scratch file.",
+        "If the user explicitly lists multiple files for a tiny repo or project scaffold, return concrete actions that cover every listed file.",
+        "Do not collapse an explicit file list into a single generic file action.",
+        "If the instruction names multiple files, ensure the final plan covers each named file with a concrete action.",
+        "Prefer one explicit action per file when scaffolding a tiny repo with named files.",
         "If the user asks to add or insert code into a named file, prefer append and preserve the existing file content.",
         "If the user asks to write or create code in a named file, use write_file unless the wording clearly implies insertion.",
         "For code-generation requests, put concrete code in replacement.",
         "Do not leave replacement empty for content-generation requests.",
+        "Do not return placeholder text as replacement for code-generation requests.",
         f"Instruction: {instruction}",
         "Lightweight repository context:",
     ]
+    if explicit_files:
+        lines.append("Explicit files mentioned by the user:")
+        lines.extend(f"- {name}" for name in explicit_files)
     lines.extend(f"- {line}" for line in build_repo_context_lines(state.get("session_id"), state.get("target_path")))
     return "\n".join(lines)

@@ -18,6 +18,18 @@ def infer_target_path_from_instruction(instruction: str, context: dict[str, Any]
     return match.group("name")
 
 
+def extract_explicit_filenames(instruction: str) -> list[str]:
+    seen: set[str] = set()
+    filenames: list[str] = []
+    for match in FILENAME_PATTERN.finditer(instruction or ""):
+        name = match.group("name")
+        if name in seen:
+            continue
+        seen.add(name)
+        filenames.append(name)
+    return filenames
+
+
 def resolve_requested_target_hint(
     state: dict[str, Any],
     context: dict[str, Any],
