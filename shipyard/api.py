@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -8,7 +7,6 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from .graph import build_graph
-from .intent_parser import parse_instruction
 from .main import _normalize_payload, run_once
 from .runtime_cleanup import cleanup_runtime_data
 from .workspaces import get_session_workspace, get_workspace_status
@@ -75,18 +73,6 @@ run_queue = RunQueue(
         progress_callback=progress_callback,
     )
 )
-
-
-def _should_run_direct(request: InstructionRequest) -> bool:
-    if os.getenv("OPENAI_API_KEY") and (request.proposal_mode or "").strip().lower() != "heuristic":
-        return False
-    parsed = parse_instruction(request.instruction or "")
-    if not parsed:
-        return False
-    mode = parsed[0]
-    testing_mode = bool((request.context or {}).get("testing_mode"))
-    return testing_mode and mode in {"write_file", "append", "prepend", "delete_file", "copy_file", "create_files", "rename_symbol"}
-
 
 WORKBENCH_HTML = """<!doctype html>
 <html lang="en">
@@ -1945,11 +1931,6 @@ def instruct(request: InstructionRequest) -> dict[str, Any]:
 
 @app.post("/queue/instruct")
 def queue_instruct(request: InstructionRequest) -> dict[str, Any]:
-    if _should_run_direct(request):
-        state = _normalize_payload(request.model_dump())
-        result = run_once(graph_app, session_store, state)
-        result["queue_job"] = run_queue.record_direct_run(state, result)
-        return result
     state = _normalize_payload(request.model_dump())
     if not state.get("session_id"):
         from .main import _ensure_session_id

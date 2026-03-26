@@ -192,15 +192,12 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(result["queued"], [])
 
-    def test_queue_instruct_runs_direct_for_trivial_testing_mode_request_without_openai(self) -> None:
-        with patch.dict("os.environ", {}, clear=True), patch(
-            "shipyard.api.run_once",
-            return_value={"status": "edited", "session_id": "demo"},
-        ) as run_once_mock, patch.object(
+    def test_queue_instruct_queues_trivial_testing_mode_request_without_openai(self) -> None:
+        with patch.dict("os.environ", {}, clear=True), patch.object(
             self.api_module.run_queue,
-            "record_direct_run",
-            return_value={"job_id": "job-direct", "status": "completed"},
-        ) as record_mock:
+            "enqueue",
+            return_value={"status": "queued", "job_id": "job-direct", "session_id": "demo"},
+        ) as enqueue_mock:
             result = queue_instruct(
                 InstructionRequest(
                     session_id="demo",
@@ -209,10 +206,9 @@ class ApiTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(result["status"], "edited")
-        run_once_mock.assert_called_once()
-        record_mock.assert_called_once()
-        self.assertEqual(result["queue_job"]["job_id"], "job-direct")
+        self.assertEqual(result["status"], "queued")
+        enqueue_mock.assert_called_once()
+        self.assertEqual(result["job_id"], "job-direct")
 
 
 if __name__ == "__main__":
