@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .repo_context import build_repo_context_lines
 from .state import RuntimeContext, ShipyardState
 
 
@@ -19,6 +20,9 @@ def build_runtime_prompt(state: ShipyardState) -> str:
     if visible_context:
         sections.append("Injected context:")
         sections.extend(_format_context(visible_context))
+
+    sections.append("Repository context:")
+    sections.extend(f"- {line}" for line in build_repo_context_lines(state.get("session_id"), state.get("target_path")))
 
     edit_mode = state.get("edit_mode")
     if edit_mode == "named_function":
@@ -57,6 +61,9 @@ def build_proposal_prompt(state: ShipyardState) -> str:
     if context:
         lines.append("Injected context:")
         lines.extend(_format_context(context))
+
+    lines.append("Lightweight repository context:")
+    lines.extend(f"- {line}" for line in build_repo_context_lines(state.get("session_id"), state.get("target_path")))
 
     helper_agent = helper_output.get("helper_agent")
     if helper_agent:

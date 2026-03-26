@@ -6,9 +6,9 @@ from typing import Any
 
 import httpx
 
-from .actions import Action, normalize_action
+from .actions import Action, build_action_fallback, normalize_action
 from .intent_parser import split_instruction_steps
-from .proposal import propose_edit
+from .repo_context import build_repo_context_lines
 from .state import ShipyardState
 
 
@@ -31,13 +31,13 @@ def _heuristic_action_plan(state: ShipyardState) -> dict[str, Any]:
             **state,
             "instruction": step,
         }
-        proposal = propose_edit(step_state)
+        proposal = build_action_fallback(step_state)
         actions.append(
             normalize_action(
                 {"instruction": step},
                 fallback=proposal,
-                provider=str(proposal.get("provider") or "heuristic"),
-                provider_reason=str(proposal.get("provider_reason") or "Derived action sequence from instruction text."),
+                provider="heuristic",
+                provider_reason="Derived action sequence from instruction text.",
             )
         )
     return {
@@ -68,19 +68,52 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
                 },
             )
             response.raise_for_status()
-    except Exception:
-        return _heuristic_action_plan(state)
+    except Exception as exc:
+        return {
+            "actions": [
+                normalize_action(
+                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                    fallback={},
+                    provider="openai",
+                    provider_reason=f"OpenAI action planning failed: {exc}",
+                )
+            ],
+            "provider": "openai",
+            "provider_reason": f"OpenAI action planning failed: {exc}",
+        }
 
     body = response.json()
     output_text = body.get("output_text", "{}")
     try:
         parsed = json.loads(output_text)
     except json.JSONDecodeError:
-        return _heuristic_action_plan(state)
+        return {
+            "actions": [
+                normalize_action(
+                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                    fallback={},
+                    provider="openai",
+                    provider_reason="OpenAI action plan response was not valid JSON.",
+                )
+            ],
+            "provider": "openai",
+            "provider_reason": "OpenAI action plan response was not valid JSON.",
+        }
 
     actions = parsed.get("actions")
     if not isinstance(actions, list) or not actions:
-        return _heuristic_action_plan(state)
+        return {
+            "actions": [
+                normalize_action(
+                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                    fallback={},
+                    provider="openai",
+                    provider_reason="OpenAI action plan response did not include actions.",
+                )
+            ],
+            "provider": "openai",
+            "provider_reason": "OpenAI action plan response did not include actions.",
+        }
 
     normalized: list[Action] = []
     for action in actions:
@@ -89,15 +122,15 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
         step_instruction = str(action.get("instruction") or "").strip()
         if not step_instruction:
             continue
-        heuristic = propose_edit({**state, "instruction": step_instruction})
-        fallback = dict(heuristic)
+        fallback = build_action_fallback(
+            {**state, "instruction": step_instruction},
+            preferred_mode=action.get("edit_mode"),
+        )
         action_payload = {
             **action,
             "instruction": step_instruction,
         }
-        if heuristic.get("target_path_source") in {"explicit_target_path", "sandboxed_target_path", "file_hint"}:
-            fallback["target_path"] = heuristic.get("target_path")
-            fallback["target_path_source"] = heuristic.get("target_path_source")
+        if fallback.get("target_path_source") in {"explicit_target_path", "sandboxed_target_path", "file_hint"}:
             action_payload.pop("target_path", None)
             action_payload.pop("target_path_source", None)
         normalized.append(
@@ -109,7 +142,18 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
             )
         )
     if not normalized:
-        return _heuristic_action_plan(state)
+        return {
+            "actions": [
+                normalize_action(
+                    {"instruction": state.get("instruction", ""), "edit_mode": state.get("edit_mode") or "anchor"},
+                    fallback={},
+                    provider="openai",
+                    provider_reason="OpenAI action plan response could not be normalized.",
+                )
+            ],
+            "provider": "openai",
+            "provider_reason": "OpenAI action plan response could not be normalized.",
+        }
     return {
         "actions": normalized,
         "provider": "openai",
@@ -119,19 +163,20 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
 
 def _build_action_plan_prompt(state: ShipyardState) -> str:
     instruction = state.get("instruction", "").strip()
-    return "\n".join(
-        [
-            "Return only JSON.",
-            "Plan the user request as an ordered list of actions.",
-            "Use the key actions with an array of objects.",
-            "Each action should include: instruction, edit_mode, target_path, anchor, replacement, quantity, copy_count, occurrence_selector.",
-            "Allowed edit_mode values: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, rename_symbol.",
-            "Do not omit separate steps just because they appear in one sentence.",
-            "If the user explicitly names a file, preserve that exact file as target_path instead of inventing a scratch file.",
-            "If the user asks to add or insert code into a named file, prefer append and preserve the existing file content.",
-            "If the user asks to write or create code in a named file, use write_file unless the wording clearly implies insertion.",
-            "For code-generation requests, put concrete code in replacement.",
-            "Do not leave replacement empty for content-generation requests.",
-            f"Instruction: {instruction}",
-        ]
-    )
+    lines = [
+        "Return only JSON.",
+        "Plan the user request as an ordered list of actions.",
+        "Use the key actions with an array of objects.",
+        "Each action should include: instruction, edit_mode, target_path, anchor, replacement, quantity, copy_count, occurrence_selector.",
+        "Allowed edit_mode values: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, rename_symbol.",
+        "Do not omit separate steps just because they appear in one sentence.",
+        "If the user explicitly names a file, preserve that exact file as target_path instead of inventing a scratch file.",
+        "If the user asks to add or insert code into a named file, prefer append and preserve the existing file content.",
+        "If the user asks to write or create code in a named file, use write_file unless the wording clearly implies insertion.",
+        "For code-generation requests, put concrete code in replacement.",
+        "Do not leave replacement empty for content-generation requests.",
+        f"Instruction: {instruction}",
+        "Lightweight repository context:",
+    ]
+    lines.extend(f"- {line}" for line in build_repo_context_lines(state.get("session_id"), state.get("target_path")))
+    return "\n".join(lines)

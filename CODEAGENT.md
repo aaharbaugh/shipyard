@@ -48,8 +48,7 @@ When OpenAI is configured, Shipyard should prefer:
 Heuristics should only be used when:
 
 - the model is unavailable
-- the model returns unusable structured output
-- a trivial fallback is genuinely safer and clearer
+- heuristic mode is explicitly requested
 
 ### Action Model
 

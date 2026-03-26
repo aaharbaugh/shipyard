@@ -2,8 +2,21 @@ from __future__ import annotations
 
 from typing import Any, TypedDict
 
-from .intent_parser import prefers_append_for_generation
+from .intent_parser import (
+    infer_edit_mode,
+    parse_instruction,
+    parse_occurrence_selector,
+    prefers_append_for_generation,
+)
+from .pathing import resolve_target_path
+from .planning_hints import (
+    infer_copy_count,
+    infer_create_quantity,
+    infer_target_path_from_instruction,
+    resolve_requested_target_hint,
+)
 from .proposal_validation import attach_validation
+from .state import ShipyardState
 
 
 SUPPORTED_ACTIONS = {
@@ -80,3 +93,40 @@ def normalize_action(
     normalized["valid"] = validated.get("is_valid", False)
     normalized["validation_errors"] = validated.get("validation_errors", [])
     return normalized
+
+
+def build_action_fallback(state: ShipyardState, preferred_mode: str | None = None) -> dict[str, Any]:
+    context = state.get("context", {}) or {}
+    instruction = state.get("instruction", "")
+    parsed = parse_instruction(instruction) if not preferred_mode else None
+    edit_mode = preferred_mode or state.get("edit_mode") or (parsed[0] if parsed else None) or infer_edit_mode(state)
+    inferred_target = infer_target_path_from_instruction(instruction, context)
+    requested_target = resolve_requested_target_hint(state, context, inferred_target)
+    target_path, target_path_source = resolve_target_path(
+        requested_target,
+        context,
+        edit_mode,
+        session_id=state.get("session_id"),
+        instruction=instruction,
+    )
+
+    fallback: dict[str, Any] = {
+        "instruction": instruction,
+        "target_path": target_path,
+        "target_path_source": target_path_source,
+        "edit_mode": edit_mode,
+        "anchor": state.get("anchor"),
+        "replacement": state.get("replacement") if state.get("replacement") is not None else (parsed[2] if parsed else None),
+        "quantity": state.get("quantity"),
+        "copy_count": state.get("copy_count"),
+        "occurrence_selector": state.get("occurrence_selector") or parse_occurrence_selector(instruction),
+    }
+    if fallback["anchor"] is None and parsed:
+        fallback["anchor"] = parsed[1]
+    if fallback["copy_count"] is None and edit_mode == "copy_file":
+        fallback["copy_count"] = infer_copy_count(instruction)
+    if fallback["quantity"] is None and edit_mode == "create_files":
+        fallback["quantity"] = infer_create_quantity(instruction)
+        if fallback.get("replacement") is None:
+            fallback["replacement"] = ""
+    return fallback

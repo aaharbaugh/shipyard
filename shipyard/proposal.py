@@ -14,11 +14,18 @@ from .intent_parser import (
     parse_occurrence_selector,
 )
 from .pathing import resolve_target_path
+from .planning_hints import (
+    infer_batch_content,
+    infer_batch_target_path,
+    infer_copy_count,
+    infer_create_quantity,
+    infer_target_path_from_instruction,
+    resolve_requested_target_hint,
+)
 from .prompts import build_proposal_prompt
 from .proposal_validation import attach_validation
 from .state import ShipyardState
 
-FILENAME_PATTERN = re.compile(r"\b(?P<name>[\w.-]+\.[A-Za-z0-9]+)\b")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -76,31 +83,47 @@ def _openai_or_fallback(state: ShipyardState) -> dict[str, Any]:
             )
             response.raise_for_status()
     except Exception as exc:
-        proposal = _heuristic_proposal(state)
-        proposal["provider"] = "heuristic"
-        proposal["provider_reason"] = f"OpenAI proposal failed: {exc}"
-        return proposal
+        return attach_validation(
+            {
+                "target_path": state.get("target_path") or state.get("context", {}).get("file_hint"),
+                "target_path_source": "explicit_target_path" if state.get("target_path") else (
+                    "file_hint" if state.get("context", {}).get("file_hint") else "unresolved"
+                ),
+                "anchor": None,
+                "replacement": None,
+                "quantity": None,
+                "copy_count": None,
+                "edit_mode": state.get("edit_mode") or infer_edit_mode(state),
+                "occurrence_selector": parse_occurrence_selector(state.get("instruction", "")),
+                "provider": "openai",
+                "provider_reason": f"OpenAI proposal failed: {exc}",
+            }
+        )
 
     body = response.json()
     output_text = _extract_response_text(body)
     try:
         parsed = json.loads(output_text)
     except json.JSONDecodeError:
-        proposal = _heuristic_proposal(state)
-        proposal["provider"] = "heuristic"
-        proposal["provider_reason"] = "OpenAI response was not valid JSON."
-        return proposal
+        return attach_validation(
+            {
+                "target_path": state.get("target_path") or state.get("context", {}).get("file_hint"),
+                "target_path_source": "explicit_target_path" if state.get("target_path") else (
+                    "file_hint" if state.get("context", {}).get("file_hint") else "unresolved"
+                ),
+                "anchor": None,
+                "replacement": None,
+                "quantity": None,
+                "copy_count": None,
+                "edit_mode": state.get("edit_mode") or infer_edit_mode(state),
+                "occurrence_selector": parse_occurrence_selector(state.get("instruction", "")),
+                "provider": "openai",
+                "provider_reason": "OpenAI response was not valid JSON.",
+            }
+        )
 
     normalized = _normalize_openai_proposal(parsed, state)
     normalized = attach_validation(normalized)
-    if not normalized.get("is_valid"):
-        proposal = _heuristic_proposal(state)
-        if proposal.get("is_valid"):
-            proposal["provider"] = "heuristic"
-            proposal["provider_reason"] = (
-                f"OpenAI model {model} returned an unusable proposal; falling back to heuristic planning."
-            )
-            return proposal
     normalized["provider"] = "openai"
     normalized["provider_reason"] = (
         f"OpenAI model {model} generated proposal for {normalized['edit_mode']} mode."
@@ -124,9 +147,9 @@ def _extract_response_text(body: dict[str, Any]) -> str:
 def _heuristic_proposal(state: ShipyardState) -> dict[str, Any]:
     context = state.get("context", {})
     edit_mode, anchor, replacement, notes = derive_edit_spec(state)
-    inferred_target = _infer_target_path_from_instruction(state.get("instruction", ""), context)
-    generated_batch_target = _infer_batch_target_path_from_instruction(state.get("instruction", ""))
-    generated_batch_content = _infer_batch_content_from_instruction(state.get("instruction", ""))
+    inferred_target = infer_target_path_from_instruction(state.get("instruction", ""), context)
+    generated_batch_target = infer_batch_target_path(state.get("instruction", ""))
+    generated_batch_content = infer_batch_content(state.get("instruction", ""))
     occurrence_selector = parse_occurrence_selector(state.get("instruction", ""))
     copy_count = None
     quantity = None
@@ -152,7 +175,7 @@ def _heuristic_proposal(state: ShipyardState) -> dict[str, Any]:
         except ValueError:
             pass
 
-    resolved_target_hint = _resolve_requested_target_hint(state, context, inferred_target)
+    resolved_target_hint = resolve_requested_target_hint(state, context, inferred_target)
 
     target_path, target_path_source = resolve_target_path(
         resolved_target_hint,
@@ -180,57 +203,11 @@ def _heuristic_proposal(state: ShipyardState) -> dict[str, Any]:
     }
     return attach_validation(proposal)
 
-
-def _infer_target_path_from_instruction(instruction: str, context: dict[str, Any]) -> str | None:
-    if context.get("function_name"):
-        return None
-
-    match = FILENAME_PATTERN.search(instruction or "")
-    if not match:
-        return None
-    return match.group("name")
-
-
-def _resolve_requested_target_hint(
-    state: ShipyardState,
-    context: dict[str, Any],
-    inferred_target: str | None,
-) -> str | None:
-    explicit_target = state.get("target_path")
-    file_hint = context.get("file_hint")
-
-    if inferred_target and _is_stale_scratch_target(explicit_target):
-        return inferred_target
-    if explicit_target:
-        return explicit_target
-
-    if inferred_target and _is_stale_scratch_target(file_hint):
-        return inferred_target
-    if file_hint:
-        return file_hint
-
-    return inferred_target
-
-
-def _is_stale_scratch_target(value: Any) -> bool:
-    if not value:
-        return False
-    name = str(value).strip().split("/")[-1]
-    return bool(re.fullmatch(r"scratch(?:-[0-9a-f]{6})?\.[A-Za-z0-9]+", name))
-
-
 def _normalize_openai_proposal(parsed: dict[str, Any], state: ShipyardState) -> dict[str, Any]:
     context = state.get("context", {})
     edit_mode = parsed.get("edit_mode") or infer_edit_mode(state)
-    heuristic = _heuristic_proposal(state)
-    inferred_target = _infer_target_path_from_instruction(state.get("instruction", ""), context)
-    explicit_target_path = _resolve_requested_target_hint(state, context, inferred_target)
-    if not explicit_target_path and heuristic.get("target_path") and heuristic.get("target_path_source") in {
-        "explicit_target_path",
-        "sandboxed_target_path",
-        "file_hint",
-    }:
-        explicit_target_path = heuristic.get("target_path")
+    inferred_target = infer_target_path_from_instruction(state.get("instruction", ""), context)
+    explicit_target_path = resolve_requested_target_hint(state, context, inferred_target)
     if not explicit_target_path:
         explicit_target_path = parsed.get("target_path")
 
@@ -259,7 +236,6 @@ def _normalize_openai_proposal(parsed: dict[str, Any], state: ShipyardState) -> 
 
     if (
         edit_mode == "anchor"
-        and heuristic.get("edit_mode") == "rename_symbol"
         and isinstance(anchor, str)
         and isinstance(replacement, str)
         and IDENTIFIER_PATTERN.fullmatch(anchor)
@@ -277,34 +253,22 @@ def _normalize_openai_proposal(parsed: dict[str, Any], state: ShipyardState) -> 
         "edit_mode": edit_mode,
         "occurrence_selector": parsed.get("occurrence_selector") or parse_occurrence_selector(state.get("instruction", "")),
     }
-    if edit_mode == "copy_file" and heuristic.get("edit_mode") == "copy_file" and heuristic.get("copy_count"):
-        normalized["copy_count"] = heuristic.get("copy_count")
-    if edit_mode == "create_files" and heuristic.get("edit_mode") == "create_files" and heuristic.get("quantity"):
-        normalized["quantity"] = heuristic.get("quantity")
+    if edit_mode == "copy_file" and not normalized.get("copy_count"):
+        normalized["copy_count"] = infer_copy_count(state.get("instruction", ""))
+    if edit_mode == "create_files" and not normalized.get("quantity"):
+        normalized["quantity"] = infer_create_quantity(state.get("instruction", ""))
         if normalized.get("replacement") is None:
-            normalized["replacement"] = heuristic.get("replacement")
-        if not parsed.get("target_path") and heuristic.get("target_path"):
-            normalized["target_path"] = heuristic.get("target_path")
-            normalized["target_path_source"] = heuristic.get("target_path_source")
+            normalized["replacement"] = infer_batch_content(state.get("instruction", "")) or ""
+        if not parsed.get("target_path"):
+            batch_target = infer_batch_target_path(state.get("instruction", ""))
+            if batch_target:
+                normalized_target, normalized_source = resolve_target_path(
+                    batch_target,
+                    context,
+                    edit_mode,
+                    session_id=state.get("session_id"),
+                    instruction=state.get("instruction"),
+                )
+                normalized["target_path"] = normalized_target
+                normalized["target_path_source"] = normalized_source
     return normalized
-
-
-def _has_embedded_generation_request(instruction: str) -> bool:
-    text = instruction.lower()
-    return "create" in text and "file" in text and "write " in text
-
-
-def _infer_batch_target_path_from_instruction(instruction: str) -> str | None:
-    match = re.search(r"\bfile\s+(?P<index>\d+)\b", instruction, flags=re.IGNORECASE)
-    if not match:
-        return None
-    index = match.group("index")
-    extension = ".py" if "python" in instruction.lower() else ".txt"
-    return f"file{index}{extension}"
-
-
-def _infer_batch_content_from_instruction(instruction: str) -> str | None:
-    match = re.search(r"\bwrite\s+(?P<content>.+)$", instruction.strip(), flags=re.IGNORECASE)
-    if not match:
-        return None
-    return match.group("content").strip().rstrip(".")

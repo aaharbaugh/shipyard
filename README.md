@@ -22,9 +22,9 @@ Shipyard is moving away from parser-led behavior and toward:
 
 - model-first action planning
 - deterministic tool execution
-- minimal heuristic fallback
+- minimal heuristic fallback only when the LLM is unavailable or explicitly bypassed
 
-Regex and local parsing still exist, but they are fallback behavior. The long-term
+Regex and local parsing still exist, but they are no longer the normal control path. The long-term
 architecture is not "add more verbs." The long-term architecture is:
 
 - `LLM planner -> structured actions -> executor -> verification`
@@ -179,7 +179,7 @@ Target design:
 - model emits structured actions
 - executor validates and runs actions
 - human approval gates risky operations
-- heuristics only rescue obvious fallback cases
+- heuristics only exist for explicit fallback mode or no-LLM operation
 
 ## Tests
 

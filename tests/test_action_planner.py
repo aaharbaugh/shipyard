@@ -31,6 +31,21 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertEqual(result["provider"], "heuristic")
         self.assertGreaterEqual(len(result["actions"]), 2)
 
+    def test_openai_action_plan_failure_returns_openai_invalid_action(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
+            "shipyard.action_planner.httpx.Client",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = plan_actions(
+                {
+                    "instruction": "replace total with totality in scratch_copy_3.py",
+                }
+            )
+
+        self.assertEqual(result["provider"], "openai")
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertFalse(result["actions"][0]["valid"])
+
     def test_single_simple_instruction_uses_openai_when_key_is_available(self) -> None:
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
             "shipyard.action_planner._openai_action_plan_or_fallback"

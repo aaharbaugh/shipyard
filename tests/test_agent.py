@@ -56,6 +56,23 @@ class AgentPlanningTests(unittest.TestCase):
         self.assertEqual(result["provider"], "heuristic")
         self.assertIn("OPENAI_API_KEY", result["provider_reason"])
 
+    def test_openai_mode_with_request_failure_does_not_fall_back_to_heuristic(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
+            "shipyard.proposal.httpx.Client",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = propose_edit(
+                {
+                    "instruction": "replace total with totality in scratch_copy_3.py",
+                    "proposal_mode": "openai",
+                    "context": {"file_hint": "scratch_copy_3.py"},
+                }
+            )
+
+        self.assertEqual(result["provider"], "openai")
+        self.assertFalse(result["is_valid"])
+        self.assertIn("OpenAI proposal failed", result["provider_reason"])
+
     def test_heuristic_proposal_switches_to_named_function_mode(self) -> None:
         result = propose_edit(
             {
@@ -152,13 +169,14 @@ class AgentPlanningTests(unittest.TestCase):
         self.assertRegex(result["target_path"], r"scratch-[0-9a-f]{6}\.js$")
         self.assertEqual(result["edit_mode"], "write_file")
 
-    def test_auto_mode_uses_fast_path_for_blank_new_file(self) -> None:
-        result = propose_edit(
-            {
-                "instruction": "make a new file",
-                "session_id": "demo",
-            }
-        )
+    def test_auto_mode_uses_heuristic_when_openai_is_unavailable_for_blank_new_file(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            result = propose_edit(
+                {
+                    "instruction": "make a new file",
+                    "session_id": "demo",
+                }
+            )
 
         self.assertEqual(result["provider"], "heuristic")
         self.assertEqual(result["edit_mode"], "write_file")
@@ -179,13 +197,14 @@ class AgentPlanningTests(unittest.TestCase):
         mocked.assert_called_once()
         self.assertEqual(result["provider"], "openai")
 
-    def test_auto_mode_uses_fast_path_for_multiple_new_files(self) -> None:
-        result = propose_edit(
-            {
-                "instruction": "make 2 new files",
-                "session_id": "demo",
-            }
-        )
+    def test_auto_mode_uses_heuristic_when_openai_is_unavailable_for_multiple_new_files(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            result = propose_edit(
+                {
+                    "instruction": "make 2 new files",
+                    "session_id": "demo",
+                }
+            )
 
         self.assertEqual(result["provider"], "heuristic")
         self.assertEqual(result["edit_mode"], "create_files")

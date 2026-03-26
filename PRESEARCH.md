@@ -14,7 +14,7 @@ Build Shipyard into a local coding agent that can:
 The main correction to the original MVP direction is this:
 
 - Shipyard should be **LLM-first**
-- parser logic should be **fallback only**
+- parser logic should be **non-primary fallback only when the model is unavailable**
 
 ---
 
@@ -234,7 +234,7 @@ editing mode. The better approach is:
 - execute through deterministic tools
 
 Parser logic should only rescue obvious trivial cases when the model is unavailable or
-returns unusable output.
+heuristic mode is explicitly selected.
 
 ### Whole-Codebase Rewrite Support
 
