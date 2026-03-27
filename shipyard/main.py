@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import uuid
 import copy
@@ -161,6 +162,14 @@ def _run_action_plan(
     steps: list[str] = []
 
     for index, action in enumerate(actions, start=1):
+        cancel_check = current_state.get("cancel_check")
+        if callable(cancel_check) and cancel_check():
+            latest_result = {
+                **current_state,
+                "status": "cancelled",
+                "error": "Run cancelled.",
+            }
+            break
         step_id = str(action.get("id") or f"step-{index}")
         depends_on = list(action.get("depends_on", []) or [])
         inputs_from = list(action.get("inputs_from", []) or [])
@@ -229,14 +238,14 @@ def _run_action_plan(
                 "timeout_seconds": action.get("timeout_seconds"),
                 "max_retries": max_retries,
             }
-            latest_result = app.invoke(
+            latest_result = _invoke_step_with_timeout(
+                app,
                 step_state,
-                config=build_langgraph_config(
-                    state.get("session_id"),
-                    instruction=step,
-                    step_index=index,
-                    step_count=len(actions),
-                ),
+                state.get("session_id"),
+                step,
+                index,
+                len(actions),
+                int(action.get("timeout_seconds") or 45),
             )
             if latest_result.get("status") in {"failed", "verification_failed", "invalid_proposal", "edit_blocked"} and attempt <= max_retries:
                 _emit_progress(
@@ -313,6 +322,40 @@ def _run_action_plan(
     latest_result["action_steps"] = action_steps
     latest_result["action_plan"] = action_plan
     return latest_result
+
+
+def _invoke_step_with_timeout(
+    app,
+    step_state: ShipyardState,
+    session_id: str | None,
+    instruction: str,
+    step_index: int,
+    step_count: int,
+    timeout_seconds: int,
+) -> ShipyardState:
+    config = build_langgraph_config(
+        session_id,
+        instruction=instruction,
+        step_index=step_index,
+        step_count=step_count,
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(app.invoke, step_state, config=config)
+        try:
+            return future.result(timeout=max(timeout_seconds, 1))
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            return {
+                **step_state,
+                "status": "failed",
+                "error": f"Step timed out after {timeout_seconds} seconds.",
+                "human_gate": {
+                    "status": "blocked",
+                    "reason": f"Step timed out after {timeout_seconds} seconds.",
+                    "action": "inspect_runtime_failure",
+                    "prompt": "Review the timed out step, then retry.",
+                },
+            }
 
 
 def _ensure_session_id(value: Any) -> str:

@@ -77,6 +77,51 @@ class RunQueueTests(unittest.TestCase):
         )
         self.assertEqual(status["session"]["queue"]["state"], "blocked")
 
+    def test_queue_can_cancel_queued_job(self) -> None:
+        gate = []
+
+        def runner(state, cb):
+            while not gate:
+                time.sleep(0.05)
+            return {"status": "edited"}
+
+        queue = RunQueue(runner)
+        queue.enqueue({"session_id": "one", "instruction": "first"})
+        second = queue.enqueue({"session_id": "two", "instruction": "second"})
+
+        cancelled = queue.cancel(second["job_id"])
+        self.assertEqual(cancelled["status"], "cancelled")
+
+        gate.append(True)
+
+    def test_queue_can_mark_active_job_cancel_requested(self) -> None:
+        seen = {"cancelled": False}
+
+        def runner(state, cb):
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if state["cancel_check"]():
+                    seen["cancelled"] = True
+                    return {"status": "cancelled"}
+                time.sleep(0.05)
+            return {"status": "edited"}
+
+        queue = RunQueue(runner)
+        job = queue.enqueue({"session_id": "demo", "instruction": "long run"})
+        time.sleep(0.1)
+        queue.cancel(job["job_id"])
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            status = queue.get_job(job["job_id"])
+            if status and status.get("status") == "cancelled":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("Active job did not cancel.")
+
+        self.assertTrue(seen["cancelled"])
+
 
 if __name__ == "__main__":
     unittest.main()

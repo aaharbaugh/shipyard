@@ -12,6 +12,7 @@ from shipyard.api import (
     InstructionRequest,
     graph_index,
     graph_sync,
+    queue_cancel,
     queue_instruct,
     queue_status,
     planner_status,
@@ -209,6 +210,16 @@ class ApiTests(unittest.TestCase):
             result = queue_status("demo")
 
         self.assertEqual(result["queued"], [])
+
+    def test_queue_cancel_returns_payload(self) -> None:
+        with patch.object(
+            self.api_module.run_queue,
+            "cancel",
+            return_value={"status": "cancelled", "session_id": "demo", "queue": {"job_id": "job1"}},
+        ):
+            result = queue_cancel(self.api_module.QueueCancelRequest(job_id="job1"))
+
+        self.assertEqual(result["status"], "cancelled")
 
     def test_queue_instruct_queues_trivial_testing_mode_request_without_openai(self) -> None:
         with patch.dict("os.environ", {}, clear=True), patch.object(

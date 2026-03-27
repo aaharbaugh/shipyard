@@ -21,6 +21,7 @@ TASK_LABELS = {
     "result_ready": "Edit Result",
     "graph_sync": "Graph Sync",
     "persisting": "Persisting",
+    "cancel_requested": "Cancel Requested",
     "completed": "Completed",
 }
 
@@ -34,6 +35,7 @@ EVENT_TO_STATUS = {
     "result_ready": "running",
     "graph_sync": "running",
     "persisting": "running",
+    "cancel_requested": "running",
 }
 
 RESULT_TO_QUEUE_STATUS = {
@@ -162,6 +164,22 @@ class RunQueue:
         with self._condition:
             return _public_job(self._jobs.get(job_id))
 
+    def cancel(self, job_id: str) -> dict[str, Any] | None:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if not job:
+                return None
+            if job_id in self._queue:
+                self._queue = deque(queued_id for queued_id in self._queue if queued_id != job_id)
+                job["status"] = "cancelled"
+                job["queue_state"] = "cancelled"
+                job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                self._record_progress(job_id, "completed", {"status": "cancelled"})
+                return _public_job(job)
+            job["cancel_requested"] = True
+            self._record_progress(job_id, "cancel_requested", {"status": "cancel_requested"})
+            return _public_job(job)
+
     def _work_loop(self) -> None:
         while True:
             with self._condition:
@@ -176,6 +194,7 @@ class RunQueue:
                 job["current_task"] = "Accepted"
 
             try:
+                job["state"]["cancel_check"] = lambda job_id=job_id: self._is_cancel_requested(job_id)
                 result = self._runner(job["state"], lambda event, payload: self._record_progress(job_id, event, payload))
                 job["result"] = result
                 job["status"] = RESULT_TO_QUEUE_STATUS.get(result.get("status"), "completed")
@@ -226,6 +245,11 @@ class RunQueue:
                 }
             )
             job["task_events"] = task_events[-12:]
+
+    def _is_cancel_requested(self, job_id: str) -> bool:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            return bool(job and job.get("cancel_requested"))
 
 
 def _infer_agents(state: ShipyardState) -> list[str]:

@@ -64,6 +64,10 @@ class CleanupRequest(BaseModel):
     remove_empty_spec_dirs: bool = True
 
 
+class QueueCancelRequest(BaseModel):
+    job_id: str
+
+
 app = FastAPI(title="Shipyard MVP API")
 graph_app = build_graph()
 session_store = SessionStore()
@@ -1154,14 +1158,14 @@ Shift+Enter adds a new line.'></textarea>
         {
           label: "Active Run",
           value: active
-            ? `${active.session_id} · ${queueMeta(active).current_task || active.status}${active.status === "running" ? dots : ""}`
+            ? `${active.session_id} · ${queueMeta(active).state || active.status}${(queueMeta(active).state || active.status) === "running" ? dots : ""}${queueMeta(active).current_task ? ` · ${queueMeta(active).current_task}` : ""}`
             : "—",
           extra: active ? badges(queueMeta(active).routing) : "",
         },
         {
           label: "Current Session",
           value: session
-            ? `${session.status}${queueMeta(session).result_status ? ` · ${queueMeta(session).result_status}` : ""}${queueMeta(session).current_task ? ` · ${queueMeta(session).current_task}` : ""}`
+            ? `${queueMeta(session).state || session.status}${queueMeta(session).result_status ? ` · ${queueMeta(session).result_status}` : ""}${queueMeta(session).current_task ? ` · ${queueMeta(session).current_task}` : ""}`
             : "—",
           extra: session ? badges(queueMeta(session).routing) : "",
         },
@@ -1180,23 +1184,31 @@ Shift+Enter adds a new line.'></textarea>
           <span class="queue-status-text">${line.value}</span>
         </div>
       `).join("");
+      const activeJobId = queueMeta(active).job_id || queueMeta(session).job_id || null;
+      const activeState = queueMeta(active).state || queueMeta(session).state || null;
+      if (activeJobId && ["queued", "planning", "running", "verifying"].includes(activeState)) {
+        queueStatusEl.innerHTML += `<div class="actions"><button id="cancel_run_button" class="secondary">Cancel Run</button></div>`;
+        const button = document.getElementById("cancel_run_button");
+        if (button) button.addEventListener("click", () => cancelRun(activeJobId));
+      }
       renderQueueTimeline(data);
     }
 
     function renderQueuedRun(job, instruction) {
       const queue = job?.queue || job || {};
       if (!queue?.job_id) return;
-      const isQueued = job.status === "queued";
+      const state = queue.state || job.status;
+      const isQueued = state === "queued";
       const currentTask = queue.current_task && queue.current_task !== "Waiting" ? queue.current_task : null;
       appendActivityMessages([
         {
           id: `assistant-${queue.job_id}`,
           role: "assistant",
           label: "Shipyard",
-          text: isQueued ? "Queued." : "Working.",
-          badge: isQueued ? null : "Working",
+          text: isQueued ? "Queued." : (state === "verifying" ? "Verifying." : "Working."),
+          badge: isQueued ? null : state,
           badgeTone: "neutral",
-          meta: [currentTask ? `Task: ${currentTask}` : null].filter(Boolean),
+          meta: [currentTask ? `Task: ${currentTask}` : null, queue.state ? `State: ${queue.state}` : null].filter(Boolean),
         },
       ]);
     }
@@ -1472,13 +1484,24 @@ Shift+Enter adds a new line.'></textarea>
       const lines = steps.slice(0, 5).map((step, index) => {
         const mode = step?.edit_mode ? ` [${step.edit_mode}]` : "";
         const target = step?.target_path ? ` -> ${String(step.target_path).split("/").pop()}` : "";
+        const status = step?.status ? ` {${step.status}}` : "";
+        const deps = Array.isArray(step?.depends_on) && step.depends_on.length ? ` deps:${step.depends_on.join(",")}` : "";
         const instruction = String(step?.instruction || "").trim() || "Unnamed step";
-        return `Plan ${index + 1}: ${instruction}${mode}${target}`;
+        return `Plan ${index + 1}: ${instruction}${mode}${target}${status}${deps}`;
       });
       if (steps.length > 5) {
         lines.push(`Plan: +${steps.length - 5} more step(s)`);
       }
       return lines;
+    }
+
+    function summarizeTasks(tasks) {
+      if (!Array.isArray(tasks) || !tasks.length) return [];
+      return tasks.slice(0, 4).map((task, index) => {
+        const status = task?.status ? ` {${task.status}}` : "";
+        const role = task?.role ? ` [${task.role}]` : "";
+        return `Task ${index + 1}: ${String(task?.goal || task?.task_id || "Unnamed task").trim()}${role}${status}`;
+      });
     }
 
     function renderResultDetails(data) {
@@ -1492,6 +1515,7 @@ Shift+Enter adds a new line.'></textarea>
       const contentHash = data?.execution?.content_hash || data?.content_hash;
       const toolOutput = data?.execution?.tool_output || data?.tool_output;
       const planSteps = summarizePlanSteps(data?.steps || []);
+      const taskSummary = summarizeTasks(data?.tasks || []);
       const previewSuffix = data?.execution?.file_preview_truncated || data?.file_preview_truncated ? "..." : "";
       const changedSummary = changedFiles.length
         ? (changedFiles.length === 1 ? `Changed: ${changedFiles[0]}` : `Changed ${changedFiles.length} files`)
@@ -1539,6 +1563,7 @@ Shift+Enter adds a new line.'></textarea>
           badgeTone: humanGate?.prompt ? "bad" : summary.tone,
         meta: [
           ...planSteps,
+          ...taskSummary,
           targetPath !== "—" ? `Target: ${targetPath}` : null,
           changedSummary,
           preview ? `Preview: ${preview}${previewSuffix}` : null,
@@ -1828,6 +1853,24 @@ Shift+Enter adds a new line.'></textarea>
       renderQueueStatus(data);
       saveState({queueStatus: data});
       return data;
+    }
+
+    async function cancelRun(jobId) {
+      if (!jobId) return;
+      try {
+        const data = await fetchJson("/queue/cancel", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({job_id: jobId})
+        });
+        saveState({lastResult: data, activeJobId: null, pending: null, pendingInstruction: null});
+        resultEl.textContent = pretty(data);
+        renderResultDetails(data);
+        stopSessionPolling();
+        await loadQueueStatus(getActiveSessionId(data) || uiState.activeSessionId);
+      } catch (error) {
+        console.error("Cancel failed", error);
+      }
     }
 
     async function loadSessions() {
@@ -2231,6 +2274,14 @@ def queue_status(session_id: str | None = None) -> dict[str, Any]:
 @app.get("/queue/job/{job_id}")
 def queue_job(job_id: str) -> dict[str, Any]:
     job = run_queue.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Queued job not found.")
+    return job
+
+
+@app.post("/queue/cancel")
+def queue_cancel(request: QueueCancelRequest) -> dict[str, Any]:
+    job = run_queue.cancel(request.job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Queued job not found.")
     return job
