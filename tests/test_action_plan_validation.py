@@ -40,6 +40,23 @@ class ActionPlanValidationTests(unittest.TestCase):
 
         self.assertTrue(any("2 steps" in error for error in errors))
 
+    def test_validate_action_plan_accepts_scaffold_files_covering_explicit_names(self) -> None:
+        errors = validate_action_plan(
+            "Create a tiny repo with main.py and config.json",
+            [
+                {
+                    "edit_mode": "scaffold_files",
+                    "valid": True,
+                    "files": [
+                        {"path": "main.py", "content": "print('hi')\n"},
+                        {"path": "config.json", "content": "{}\n"},
+                    ],
+                }
+            ],
+        )
+
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

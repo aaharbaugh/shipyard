@@ -126,7 +126,7 @@ class AgentPlanningTests(unittest.TestCase):
             }
         )
 
-        self.assertIn("/.shipyard/data/workspace/demo/unknown.txt", result["target_path"])
+        self.assertIn("/.shipyard/data/workspace/default/unknown.txt", result["target_path"])
         self.assertEqual(result["target_path_source"], "sandboxed_target_path")
 
     def test_heuristic_proposal_captures_middle_occurrence_selector(self) -> None:
@@ -154,7 +154,7 @@ class AgentPlanningTests(unittest.TestCase):
         )
 
         self.assertEqual(result["edit_mode"], "delete_file")
-        self.assertIn("/.shipyard/data/workspace/demo/unknown-Copy.txt", result["target_path"])
+        self.assertIn("/.shipyard/data/workspace/default/unknown-Copy.txt", result["target_path"])
         self.assertTrue(result["is_valid"])
 
     def test_heuristic_proposal_infers_javascript_filename_for_new_file(self) -> None:
@@ -166,7 +166,7 @@ class AgentPlanningTests(unittest.TestCase):
             }
         )
 
-        self.assertRegex(result["target_path"], r"scratch-[0-9a-f]{6}\.js$")
+        self.assertRegex(result["target_path"], r"file-[0-9a-f]{6}\.js$")
         self.assertEqual(result["edit_mode"], "write_file")
 
     def test_auto_mode_uses_heuristic_when_openai_is_unavailable_for_blank_new_file(self) -> None:
@@ -464,8 +464,8 @@ class AgentPlanningTests(unittest.TestCase):
 
         self.assertTrue(result["is_valid"])
         self.assertEqual(result["edit_mode"], "write_file")
-        self.assertTrue(result["target_path"].endswith("scratch.py"))
-        self.assertIn("/demo-session/", result["target_path"])
+        self.assertTrue(result["target_path"].endswith("file.py"))
+        self.assertIn("/default/", result["target_path"])
 
 
 if __name__ == "__main__":

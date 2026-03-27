@@ -84,8 +84,8 @@ class ApiTests(unittest.TestCase):
 
         history = get_session_history("api-test")["history"]
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["proposal_provider"], "heuristic")
-        self.assertTrue(history[0]["proposal_valid"])
+        self.assertEqual(history[0]["status"], "verified")
+        self.assertEqual(history[0]["changed_files"], [str(target)])
 
     def test_graph_status_returns_payload(self) -> None:
         with patch(
@@ -181,6 +181,24 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "queued")
         self.assertEqual(result["session_id"], "demo")
+
+    def test_queue_instruct_writes_request_receipt_for_web_session(self) -> None:
+        with patch.object(
+            self.api_module.run_queue,
+            "enqueue",
+            return_value={"status": "queued", "session_id": "web-demo", "job_id": "job1", "current_task": "Waiting"},
+        ), patch("shipyard.api.LOGS_ROOT", Path(self.tempdir.name) / "logs"):
+            result = queue_instruct(
+                InstructionRequest(
+                    session_id="web-demo",
+                    instruction="inspect the repo",
+                )
+            )
+
+        self.assertEqual(result["status"], "queued")
+        receipt = Path(self.tempdir.name) / "logs" / "latest-web-demo-request.json"
+        self.assertTrue(receipt.exists())
+        self.assertIn("inspect the repo", receipt.read_text(encoding="utf-8"))
 
     def test_queue_status_returns_payload(self) -> None:
         with patch.object(

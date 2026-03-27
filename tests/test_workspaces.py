@@ -70,6 +70,7 @@ class WorkspaceTests(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertTrue(first.exists())
+            self.assertEqual(first.name, "default")
 
     def test_temp_target_path_reuses_session_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch(
@@ -78,21 +79,21 @@ class WorkspaceTests(unittest.TestCase):
         ):
             target = create_temp_target_path(session_id="abc123")
 
-            self.assertEqual(target, Path(tmpdir) / "workspaces" / "abc123" / "scratch.py")
+            self.assertEqual(target, Path(tmpdir) / "workspaces" / "default" / "file.py")
 
     def test_temp_target_path_can_generate_unique_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "shipyard.workspaces.WORKSPACE_ROOT",
             Path(tmpdir) / "workspaces",
         ):
-            workspace = Path(tmpdir) / "workspaces" / "abc123"
+            workspace = Path(tmpdir) / "workspaces" / "default"
             workspace.mkdir(parents=True, exist_ok=True)
-            (workspace / "scratch.py").write_text("", encoding="utf-8")
+            (workspace / "file.py").write_text("", encoding="utf-8")
 
             target = create_temp_target_path(session_id="abc123", unique=True)
 
-            self.assertNotEqual(target.name, "scratch.py")
-            self.assertTrue(target.name.startswith("scratch-"))
+            self.assertNotEqual(target.name, "file.py")
+            self.assertTrue(target.name.startswith("file-"))
 
 
 if __name__ == "__main__":

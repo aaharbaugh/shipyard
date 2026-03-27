@@ -35,15 +35,11 @@ class SessionStoreTests(unittest.TestCase):
             self.assertTrue(session_dir.endswith("abc123"))
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded["status"], "verified")
-            self.assertEqual(loaded["edit_mode"], "named_function")
-            self.assertEqual(loaded["proposal_summary"]["provider"], "openai")
-            self.assertTrue(loaded["code_graph_status"]["refresh_required"])
-            self.assertEqual(sessions[0]["edit_mode"], "named_function")
+            self.assertEqual(loaded["request"]["instruction"], "demo")
+            self.assertEqual(loaded["plan"]["provider"], "openai")
+            self.assertEqual(loaded["execution"]["changed_files"], ["/tmp/demo.py"])
             self.assertEqual(sessions[0]["changed_files"], ["/tmp/demo.py"])
             self.assertEqual(sessions[0]["content_hash"], "abc123")
-            self.assertEqual(sessions[0]["proposal_provider"], "openai")
-            self.assertTrue(sessions[0]["proposal_valid"])
-            self.assertTrue(sessions[0]["code_graph_refresh_required"])
 
 
 if __name__ == "__main__":
