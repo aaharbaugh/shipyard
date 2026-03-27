@@ -8,7 +8,16 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from shipyard.main import _maybe_sync_graph, _run_action_plan, _should_skip_graph_sync, main, parse_user_input, read_user_input, run_once
+from shipyard.main import (
+    _maybe_sync_graph,
+    _run_action_plan,
+    _sanitize_stale_target_request,
+    _should_skip_graph_sync,
+    main,
+    parse_user_input,
+    read_user_input,
+    run_once,
+)
 from shipyard.main import _attach_file_outcome
 
 
@@ -92,8 +101,8 @@ class MainInputTests(unittest.TestCase):
             main()
 
         rendered = output.getvalue()
-        self.assertIn("proposal_summary:", rendered)
-        self.assertIn('"provider": "heuristic"', rendered)
+        self.assertNotIn("proposal_summary:", rendered)
+        self.assertIn("status=verified", rendered)
 
     def test_maybe_sync_graph_skips_internal_runtime_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch("shipyard.main.Path.cwd", return_value=Path(tmpdir)):
@@ -114,6 +123,18 @@ class MainInputTests(unittest.TestCase):
                 }
             )
         )
+
+    def test_sanitize_stale_target_request_clears_generic_file_when_prompt_names_real_file(self) -> None:
+        result = _sanitize_stale_target_request(
+            {
+                "instruction": "remove all the runs from main.py except for one.",
+                "target_path": "/tmp/file.py",
+                "context": {"file_hint": "/tmp/file.py", "testing_mode": True},
+            }
+        )
+
+        self.assertIsNone(result["target_path"])
+        self.assertNotIn("file_hint", result["context"])
 
     def test_attach_file_outcome_adds_preview_and_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -165,6 +186,8 @@ class MainInputTests(unittest.TestCase):
         self.assertEqual(app.invoke.call_count, 2)
         self.assertEqual(result["changed_files"], ["/tmp/file1.txt", "/tmp/file2.txt"])
         self.assertEqual(result["instruction_steps"], ["create 2 files", "write hello"])
+        self.assertEqual(result["instruction"], "create 2 files and write hello")
+        self.assertEqual(result["request_instruction"], "create 2 files and write hello")
 
     def test_run_once_short_circuits_invalid_action_plan(self) -> None:
         app = Mock()
@@ -195,7 +218,65 @@ class MainInputTests(unittest.TestCase):
 
         app.invoke.assert_not_called()
         self.assertEqual(result["status"], "invalid_action_plan")
-        self.assertIn("config.json", result["error"])
+        self.assertIn("config.json", result["execution"]["error"])
+        self.assertIn("troubleshooting_path", result["artifacts"])
+
+    def test_run_once_persists_failed_result_when_execution_raises(self) -> None:
+        app = Mock()
+        session_store = Mock()
+
+        with patch("shipyard.main.PromptLog") as prompt_log_cls, patch(
+            "shipyard.main.generate_spec_bundle",
+            return_value={"mode": "direct_edit", "created": False},
+        ), patch(
+            "shipyard.main.plan_actions",
+            return_value={
+                "actions": [{"instruction": "Inspect repo", "edit_mode": "list_files", "valid": True, "validation_errors": []}],
+                "provider": "openai",
+                "provider_reason": "planned",
+                "is_valid": True,
+                "validation_errors": [],
+            },
+        ), patch(
+            "shipyard.main._run_action_plan",
+            side_effect=IsADirectoryError("boom"),
+        ):
+            prompt_log_cls.return_value.append = Mock()
+            result = run_once(
+                app,
+                session_store,
+                {
+                    "session_id": "web-test",
+                    "instruction": "Inspect repo and continue",
+                },
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("boom", result["execution"]["error"])
+        self.assertIn("troubleshooting_path", result["artifacts"])
+
+    def test_run_action_plan_keeps_edited_status_when_final_step_is_observation(self) -> None:
+        app = Mock()
+        app.invoke.side_effect = [
+            {"status": "observed", "no_op": True, "tool_output": {"tool": "read_file"}},
+            {"status": "edited", "no_op": False, "target_path": "/tmp/main.py", "changed_files": ["/tmp/main.py"]},
+            {"status": "observed", "no_op": True, "tool_output": {"tool": "run_command", "returncode": 0}},
+        ]
+
+        result = _run_action_plan(
+            app,
+            {"session_id": "demo", "instruction": "edit and verify", "request_instruction": "edit and verify"},
+            {
+                "actions": [
+                    {"instruction": "Read main.py", "edit_mode": "read_file"},
+                    {"instruction": "Edit main.py", "edit_mode": "anchor"},
+                    {"instruction": "Run main.py", "edit_mode": "run_command"},
+                ]
+            },
+        )
+
+        self.assertEqual(result["status"], "edited")
+        self.assertFalse(result["no_op"])
 
 
 if __name__ == "__main__":

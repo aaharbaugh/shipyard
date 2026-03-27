@@ -18,6 +18,10 @@ def _find_occurrences(content: str, anchor: str) -> list[int]:
         start = index + len(anchor)
 
 
+def find_anchor_pointers(content: str, anchor: str) -> list[dict[str, int]]:
+    return [{"start": start, "end": start + len(anchor)} for start in _find_occurrences(content, anchor)]
+
+
 def _find_occurrences_casefold(content: str, anchor: str) -> list[int]:
     if not anchor:
         return []
@@ -36,6 +40,8 @@ def _find_occurrences_casefold(content: str, anchor: str) -> list[int]:
 
 def _resolve_occurrence_index(match_count: int, occurrence_selector: str | None) -> int | None:
     if occurrence_selector is None:
+        return None
+    if occurrence_selector == "all":
         return None
 
     mapping = {
@@ -90,6 +96,13 @@ def apply_anchor_edit(
         if positions:
             anchor_length = len(anchor)
 
+    if occurrence_selector == "all":
+        updated = content
+        for start in reversed(positions):
+            updated = updated[:start] + replacement + updated[start + anchor_length:]
+        file_path.write_text(updated, encoding="utf-8")
+        return updated
+
     if occurrence_selector is None:
         start = positions[0]
     else:
@@ -97,6 +110,45 @@ def apply_anchor_edit(
         start = positions[occurrence_index]
 
     updated = content[:start] + replacement + content[start + anchor_length:]
+    file_path.write_text(updated, encoding="utf-8")
+    return updated
+
+
+def validate_pointer_edits(content: str, pointers: list[dict[str, int]], anchor: str | None = None) -> None:
+    if not isinstance(pointers, list) or not pointers:
+        raise AnchorEditError("Pointers were not provided for pointer-based edit.")
+
+    last_end = -1
+    for index, pointer in enumerate(sorted(pointers, key=lambda item: item["start"]), start=1):
+        start = pointer.get("start")
+        end = pointer.get("end")
+        if not isinstance(start, int) or not isinstance(end, int):
+            raise AnchorEditError(f"Pointer {index} requires integer start and end.")
+        if start < 0 or end < start or end > len(content):
+            raise AnchorEditError(f"Pointer {index} is outside the file bounds.")
+        if start < last_end:
+            raise AnchorEditError("Pointers overlap in the target file.")
+        if anchor is not None and content[start:end] != anchor:
+            raise AnchorEditError(f"Pointer {index} does not match the requested anchor text.")
+        last_end = end
+
+
+def apply_pointer_edits(
+    path: str,
+    pointers: list[dict[str, int]],
+    replacement: str,
+    anchor: str | None = None,
+) -> str:
+    file_path = Path(path)
+    content = file_path.read_text(encoding="utf-8")
+    validate_pointer_edits(content, pointers, anchor)
+
+    updated = content
+    for pointer in sorted(pointers, key=lambda item: item["start"], reverse=True):
+        start = pointer["start"]
+        end = pointer["end"]
+        updated = updated[:start] + replacement + updated[end:]
+
     file_path.write_text(updated, encoding="utf-8")
     return updated
 

@@ -13,12 +13,13 @@ from .graph import build_graph
 from .intent_parser import parse_instruction
 from .langsmith_config import build_langgraph_config
 from .plan_feature import generate_spec_bundle
+from .planning_hints import extract_explicit_filenames, is_stale_scratch_target
 from .prompt_log import PromptLog
 from .runtime_state import enrich_state_sections
 from .session_store import SessionStore
 from .state import ShipyardState
 from .tools.code_graph import inspect_code_graph_status, sync_live_code_graph
-from .tracing import write_trace
+from .tracing import write_trace, write_troubleshooting_log
 
 
 def parse_user_input(raw: str) -> ShipyardState:
@@ -86,42 +87,60 @@ def run_once(
     state: ShipyardState,
     progress_callback: Callable[[str, dict[str, Any] | None], None] | None = None,
 ) -> ShipyardState:
+    state = _sanitize_stale_target_request(state)
     state["session_id"] = _ensure_session_id(state.get("session_id"))
-    _emit_progress(progress_callback, "accepted", {"session_id": state["session_id"]})
-    PromptLog().append(state)
-    _emit_progress(progress_callback, "spec_bundle", {"instruction": state.get("instruction")})
-    spec_bundle = generate_spec_bundle(state.get("session_id"), state.get("instruction", ""))
-    if spec_bundle.get("created") or spec_bundle.get("mode"):
-        state["spec_bundle"] = spec_bundle
-    action_plan = plan_actions(state)
-    if not action_plan.get("is_valid", True):
-        result = _invalid_action_plan_result(state, action_plan)
-        result = _sanitize_runtime_result(result)
-        trace_path = write_trace(result)
-        result["trace_path"] = trace_path
-        result = enrich_state_sections(result)
-        session_store.append_run(result)
-        _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": trace_path})
+    state["request_instruction"] = str(state.get("request_instruction") or state.get("instruction") or "")
+    action_plan: dict[str, Any] | None = None
+    try:
+        _emit_progress(progress_callback, "accepted", {"session_id": state["session_id"]})
+        PromptLog().append(state)
+        _emit_progress(progress_callback, "spec_bundle", {"instruction": state.get("instruction")})
+        spec_bundle = generate_spec_bundle(state.get("session_id"), state.get("instruction", ""))
+        if spec_bundle.get("created") or spec_bundle.get("mode"):
+            state["spec_bundle"] = spec_bundle
+        action_plan = plan_actions(state)
+        if not action_plan.get("is_valid", True):
+            result = _invalid_action_plan_result(state, action_plan)
+            result = _persist_result(session_store, result)
+            _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
+            return result
+        result = _run_action_plan(app, state, action_plan, progress_callback)
+        if spec_bundle:
+            result["spec_bundle"] = spec_bundle
+        _emit_progress(progress_callback, "result_ready", {"status": result.get("status")})
+        graph_sync = _maybe_sync_graph(result)
+        if graph_sync is not None:
+            _emit_progress(progress_callback, "graph_sync", {"attempted": graph_sync.get("attempted")})
+            result["graph_sync"] = graph_sync
+            if graph_sync.get("status"):
+                result["code_graph_status"] = graph_sync["status"]
+        result = _attach_file_outcome(result)
+        result = _persist_result(session_store, result)
+        _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
         return result
-    result = _run_action_plan(app, state, action_plan, progress_callback)
-    if spec_bundle:
-        result["spec_bundle"] = spec_bundle
-    _emit_progress(progress_callback, "result_ready", {"status": result.get("status")})
-    graph_sync = _maybe_sync_graph(result)
-    if graph_sync is not None:
-        _emit_progress(progress_callback, "graph_sync", {"attempted": graph_sync.get("attempted")})
-        result["graph_sync"] = graph_sync
-        if graph_sync.get("status"):
-            result["code_graph_status"] = graph_sync["status"]
-    result = _attach_file_outcome(result)
-    result = _sanitize_runtime_result(result)
-    _emit_progress(progress_callback, "persisting", {"status": result.get("status")})
-    trace_path = write_trace(result)
-    result["trace_path"] = trace_path
-    result = enrich_state_sections(result)
-    session_store.append_run(result)
-    _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": trace_path})
-    return result
+    except Exception as exc:
+        result = _failed_runtime_result(state, str(exc), action_plan=action_plan)
+        result = _persist_result(session_store, result)
+        _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path"), "error": result.get("error")})
+        return result
+
+
+def _sanitize_stale_target_request(state: ShipyardState) -> ShipyardState:
+    instruction = state.get("instruction", "")
+    explicit_files = extract_explicit_filenames(instruction)
+    if not explicit_files:
+        return state
+
+    sanitized = dict(state)
+    context = dict(state.get("context", {}) or {})
+    target_path = sanitized.get("target_path")
+    if target_path and is_stale_scratch_target(target_path):
+        sanitized["target_path"] = None
+    file_hint = context.get("file_hint")
+    if file_hint and is_stale_scratch_target(file_hint):
+        context.pop("file_hint", None)
+    sanitized["context"] = context
+    return sanitized
 
 
 def _run_action_plan(
@@ -130,56 +149,168 @@ def _run_action_plan(
     action_plan: dict[str, Any],
     progress_callback: Callable[[str, dict[str, Any] | None], None] | None = None,
 ) -> ShipyardState:
+    request_instruction = str(state.get("request_instruction") or state.get("instruction") or "")
+    current_state: ShipyardState = dict(state)
     actions = list(action_plan.get("actions", []) or [])
     if not actions:
         actions = [{"instruction": state.get("instruction", "")}]
     aggregated_changed_files: list[str] = []
+    action_steps: list[dict[str, Any]] = []
+    completed_step_ids: set[str] = set()
     latest_result: ShipyardState = dict(state)
     steps: list[str] = []
 
     for index, action in enumerate(actions, start=1):
+        step_id = str(action.get("id") or f"step-{index}")
+        depends_on = list(action.get("depends_on", []) or [])
+        inputs_from = list(action.get("inputs_from", []) or [])
         step = str(action.get("instruction") or "").strip() or state.get("instruction", "")
         steps.append(step)
+        unmet_dependencies = [dependency for dependency in depends_on if dependency not in completed_step_ids]
+        if unmet_dependencies:
+            latest_result = {
+                **current_state,
+                "status": "blocked",
+                "error": f"Unmet step dependencies: {', '.join(unmet_dependencies)}",
+                "human_gate": {
+                    "status": "blocked",
+                    "reason": f"Unmet step dependencies: {', '.join(unmet_dependencies)}",
+                    "action": "inspect_plan_dependencies",
+                    "prompt": "Review the plan dependencies, then retry.",
+                },
+            }
+            action_steps.append(
+                {
+                    "id": step_id,
+                    "instruction": step,
+                    "action_class": action.get("action_class"),
+                    "edit_mode": action.get("edit_mode"),
+                    "target_path": action.get("target_path"),
+                    "depends_on": depends_on,
+                    "inputs_from": inputs_from,
+                    "status": "blocked",
+                    "changed_files": [],
+                    "no_op": True,
+                }
+            )
+            break
         _emit_progress(
             progress_callback,
-            "lead_agent",
-            {"instruction": step, "step_index": index, "step_count": len(actions)},
+            "verifying" if action.get("action_class") == "verify" else "lead_agent",
+            {"instruction": step, "step_index": index, "step_count": len(actions), "step_id": step_id},
         )
-        step_state: ShipyardState = {
-            **state,
-            "instruction": step,
-            "target_path": action.get("target_path"),
-            "edit_mode": action.get("edit_mode"),
-            "anchor": action.get("anchor"),
-            "replacement": action.get("replacement"),
-            "quantity": action.get("quantity"),
-            "copy_count": action.get("copy_count"),
-            "occurrence_selector": action.get("occurrence_selector"),
-            "changed_files": [],
+        max_retries = int(action.get("max_retries") or (1 if action.get("action_class") in {"inspect", "verify"} else 0))
+        attempt = 0
+        while True:
+            attempt += 1
+            step_state: ShipyardState = {
+                **current_state,
+                "request_instruction": request_instruction,
+                "instruction": step,
+                "task_id": step_id,
+                "target_path": action.get("target_path"),
+                "edit_mode": action.get("edit_mode"),
+                "anchor": action.get("anchor"),
+                "replacement": action.get("replacement"),
+                "pattern": action.get("pattern"),
+                "command": action.get("command"),
+                "pointers": action.get("pointers"),
+                "quantity": action.get("quantity"),
+                "copy_count": action.get("copy_count"),
+                "files": action.get("files"),
+                "source_path": action.get("source_path"),
+                "destination_path": action.get("destination_path"),
+                "paths": action.get("paths"),
+                "preplanned_action": action,
+                "occurrence_selector": action.get("occurrence_selector"),
+                "changed_files": [],
+                "depends_on": depends_on,
+                "inputs_from": inputs_from,
+                "timeout_seconds": action.get("timeout_seconds"),
+                "max_retries": max_retries,
+            }
+            latest_result = app.invoke(
+                step_state,
+                config=build_langgraph_config(
+                    state.get("session_id"),
+                    instruction=step,
+                    step_index=index,
+                    step_count=len(actions),
+                ),
+            )
+            if latest_result.get("status") in {"failed", "verification_failed", "invalid_proposal", "edit_blocked"} and attempt <= max_retries:
+                _emit_progress(
+                    progress_callback,
+                    "step_retry",
+                    {"instruction": step, "step_index": index, "attempt": attempt + 1, "step_id": step_id},
+                )
+                continue
+            break
+        step_changed_files = list(latest_result.get("changed_files", []) or [])
+        if not step_changed_files and not latest_result.get("no_op") and latest_result.get("target_path"):
+            target = Path(str(latest_result["target_path"]))
+            if target.exists() and target.is_file():
+                step_changed_files = [str(target.resolve())]
+        aggregated_changed_files.extend(step_changed_files)
+        tool_outputs = list(current_state.get("tool_outputs", []) or [])
+        if latest_result.get("tool_output"):
+            tool_outputs.append(latest_result["tool_output"])
+        current_state = {
+            **current_state,
+            **latest_result,
+            "tool_outputs": tool_outputs,
+            "context": {
+                **dict(current_state.get("context", {}) or {}),
+                **dict(latest_result.get("context", {}) or {}),
+                "tool_outputs": tool_outputs,
+            },
         }
-        latest_result = app.invoke(
-            step_state,
-            config=build_langgraph_config(
-                state.get("session_id"),
-                instruction=step,
-                step_index=index,
-                step_count=len(actions),
-            ),
+        action_steps.append(
+            {
+                "id": step_id,
+                "instruction": step,
+                "action_class": action.get("action_class"),
+                "edit_mode": action.get("edit_mode"),
+                "target_path": latest_result.get("target_path"),
+                "anchor": action.get("anchor"),
+                "pattern": action.get("pattern"),
+                "command": action.get("command"),
+                "pointers": action.get("pointers"),
+                "replacement_preview": str(action.get("replacement") or "")[:120],
+                "depends_on": depends_on,
+                "inputs_from": inputs_from,
+                "timeout_seconds": action.get("timeout_seconds"),
+                "max_retries": max_retries,
+                "status": latest_result.get("status"),
+                "changed_files": step_changed_files,
+                "no_op": bool(latest_result.get("no_op")),
+            }
         )
-        aggregated_changed_files.extend(latest_result.get("changed_files", []) or [])
-        if latest_result.get("status") not in {"edited", "verified"}:
+        if latest_result.get("status") in {"edited", "verified", "observed"}:
+            completed_step_ids.add(step_id)
+        if latest_result.get("status") not in {"edited", "verified", "observed"}:
             break
 
+    had_material_edit = any(
+        step.get("status") in {"edited", "verified"} and not step.get("no_op")
+        for step in action_steps
+    )
+    deduped: list[str] = []
     if aggregated_changed_files:
-        deduped: list[str] = []
         seen: set[str] = set()
         for path in aggregated_changed_files:
             if path in seen:
                 continue
             deduped.append(path)
             seen.add(path)
-        latest_result["changed_files"] = deduped
+    latest_result["changed_files"] = deduped
+    if latest_result.get("status") == "observed" and had_material_edit:
+        latest_result["status"] = "edited"
+        latest_result["no_op"] = False
+    latest_result["request_instruction"] = request_instruction
+    latest_result["instruction"] = request_instruction
     latest_result["instruction_steps"] = steps
+    latest_result["action_steps"] = action_steps
     latest_result["action_plan"] = action_plan
     return latest_result
 
@@ -209,6 +340,39 @@ def _invalid_action_plan_result(state: ShipyardState, action_plan: dict[str, Any
             "details": {"validation_errors": errors},
         },
     }
+
+
+def _failed_runtime_result(
+    state: ShipyardState,
+    error: str,
+    *,
+    action_plan: dict[str, Any] | None = None,
+) -> ShipyardState:
+    result = {
+        **state,
+        "status": "failed",
+        "error": error,
+        "human_gate": {
+            "status": "blocked",
+            "reason": error,
+            "action": "inspect_runtime_failure",
+            "prompt": "Review the runtime failure details, then retry.",
+        },
+    }
+    if action_plan:
+        result["action_plan"] = action_plan
+    return result
+
+
+def _persist_result(session_store: SessionStore, result: ShipyardState) -> ShipyardState:
+    result = _sanitize_runtime_result(result)
+    trace_path = write_trace(result)
+    result["trace_path"] = trace_path
+    troubleshooting_path = write_troubleshooting_log(result)
+    result["troubleshooting_path"] = troubleshooting_path
+    result = enrich_state_sections(result)
+    session_store.append_run(result)
+    return result
 
 
 def _maybe_sync_graph(state: ShipyardState) -> dict[str, Any] | None:
@@ -290,8 +454,11 @@ def _attach_file_outcome(state: ShipyardState) -> ShipyardState:
     existing_changed_files = list(enriched.get("changed_files", []) or [])
     if existing_changed_files:
         enriched["changed_files"] = existing_changed_files
+    if enriched.get("no_op") and not existing_changed_files:
+        return enriched
 
-    file_path = Path(target_path)
+    preview_target = existing_changed_files[-1] if existing_changed_files else target_path
+    file_path = Path(preview_target)
     if not file_path.exists() or not file_path.is_file():
         return enriched
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -9,6 +11,7 @@ from pydantic import BaseModel, Field
 from .graph import build_graph
 from .main import _normalize_payload, run_once
 from .runtime_cleanup import cleanup_runtime_data
+from .storage_paths import LOGS_ROOT, ensure_dir
 from .workspaces import get_session_workspace, get_workspace_status
 from .session_store import SessionStore
 from .proposal import get_planner_status
@@ -943,6 +946,62 @@ Shift+Enter adds a new line.'></textarea>
       localStorage.setItem(STORAGE_KEY, JSON.stringify(uiState));
     }
 
+    function getRunMessageMap() {
+      const value = uiState.runMessageMap;
+      return value && typeof value === "object" ? value : {};
+    }
+
+    function saveRunMessageMap(map) {
+      saveState({runMessageMap: map});
+    }
+
+    function rememberRunMessageIds(keys, ids) {
+      const map = {...getRunMessageMap()};
+      for (const key of keys || []) {
+        if (!key) continue;
+        map[String(key)] = ids;
+      }
+      saveRunMessageMap(map);
+    }
+
+    function lookupRunMessageIds(keys) {
+      const map = getRunMessageMap();
+      for (const key of keys || []) {
+        if (!key) continue;
+        const value = map[String(key)];
+        if (value?.userId && value?.assistantId) return value;
+      }
+      return null;
+    }
+
+    function getSubmittedInstructions() {
+      const value = uiState.submittedInstructions;
+      return value && typeof value === "object" ? value : {};
+    }
+
+    function rememberSubmittedInstruction(keys, text) {
+      const submitted = {...getSubmittedInstructions()};
+      for (const key of keys || []) {
+        if (!key) continue;
+        submitted[String(key)] = text;
+      }
+      saveState({submittedInstructions: submitted});
+    }
+
+    function lookupSubmittedInstruction(keys) {
+      const submitted = getSubmittedInstructions();
+      for (const key of keys || []) {
+        if (!key) continue;
+        const value = submitted[String(key)];
+        if (typeof value === "string" && value.trim()) return value;
+      }
+      return null;
+    }
+
+    function findActivityMessage(id) {
+      return (Array.isArray(uiState.activityMessages) ? uiState.activityMessages : []).find((message) => message?.id === id) || null;
+    }
+
     function currentFormState() {
       return {
         instruction: document.getElementById("instruction").value,
@@ -970,10 +1029,12 @@ Shift+Enter adds a new line.'></textarea>
         lastResult: null,
         pending: null,
         pendingInstruction: null,
+        runMessageMap: {},
         activeSessionId: null,
         activeJobId: null,
         lastCompletedJobId: null,
         queueStatus: null,
+        submittedInstructions: {},
         form: currentFormState(),
       });
       renderActivityStream([]);
@@ -981,6 +1042,26 @@ Shift+Enter adds a new line.'></textarea>
       queueTimelineEl.innerHTML = "";
       resultEl.textContent = pretty({});
       instructionEl.focus();
+    }
+
+    function clearPendingState() {
+      const pendingId = uiState.activeSessionId || "session";
+      const messages = Array.isArray(uiState.activityMessages) ? uiState.activityMessages : [];
+      const filtered = messages.filter((message) => message?.id !== `pending-${pendingId}`);
+      saveState({pending: null, pendingInstruction: null, activityMessages: filtered});
+      renderActivityStream(filtered);
+    }
+
+    function clearTransientRunMessages() {
+      const messages = Array.isArray(uiState.activityMessages) ? uiState.activityMessages : [];
+      const filtered = messages.filter((message) => {
+        if (message?.role !== "assistant") return true;
+        if (message?.badge === "Queued" || message?.badge === "Working") return false;
+        if (message?.text === "Queued." || message?.text === "Working.") return false;
+        return true;
+      });
+      saveState({activityMessages: filtered});
+      renderActivityStream(filtered);
     }
 
     function sanitizeActivityMessages(messages) {
@@ -1007,11 +1088,20 @@ Shift+Enter adds a new line.'></textarea>
       return match ? match[1] : null;
     }
 
+    function extractExplicitFilenames(instruction) {
+      const matches = String(instruction || "").match(/\b[\w.-]+\.[A-Za-z0-9]+\b/g) || [];
+      return [...new Set(matches)];
+    }
+
+    function isExplicitScaffoldPrompt(instruction) {
+      return extractExplicitFilenames(instruction).length > 1;
+    }
+
     function isStaleScratchTarget(value) {
       const raw = String(value || "").trim();
       if (!raw) return false;
       const name = raw.split("/").pop();
-      return /^scratch(?:-[0-9a-f]{6})?\.[A-Za-z0-9]+$/i.test(name);
+      return /^(?:scratch|file)(?:-[0-9a-f]{6})?\.[A-Za-z0-9]+$/i.test(name);
     }
 
     function pretty(value) {
@@ -1050,6 +1140,7 @@ Shift+Enter adds a new line.'></textarea>
       const active = data?.active;
       const session = data?.session;
       const dots = `<span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>`;
+      const queueMeta = (job) => job?.queue || {};
       const badges = (routing) => {
         if (!routing) return "";
         const relation = routing?.relation_to_previous?.label;
@@ -1063,16 +1154,16 @@ Shift+Enter adds a new line.'></textarea>
         {
           label: "Active Run",
           value: active
-            ? `${active.session_id} · ${active.current_task || active.status}${active.status === "running" ? dots : ""}`
+            ? `${active.session_id} · ${queueMeta(active).current_task || active.status}${active.status === "running" ? dots : ""}`
             : "—",
-          extra: active ? badges(active.routing) : "",
+          extra: active ? badges(queueMeta(active).routing) : "",
         },
         {
           label: "Current Session",
           value: session
-            ? `${session.status}${session.result_status ? ` · ${session.result_status}` : ""}${session.current_task ? ` · ${session.current_task}` : ""}`
+            ? `${session.status}${queueMeta(session).result_status ? ` · ${queueMeta(session).result_status}` : ""}${queueMeta(session).current_task ? ` · ${queueMeta(session).current_task}` : ""}`
             : "—",
-          extra: session ? badges(session.routing) : "",
+          extra: session ? badges(queueMeta(session).routing) : "",
         },
         {
           label: "Queued",
@@ -1093,16 +1184,19 @@ Shift+Enter adds a new line.'></textarea>
     }
 
     function renderQueuedRun(job, instruction) {
-      if (!job?.job_id) return;
+      const queue = job?.queue || job || {};
+      if (!queue?.job_id) return;
+      const isQueued = job.status === "queued";
+      const currentTask = queue.current_task && queue.current_task !== "Waiting" ? queue.current_task : null;
       appendActivityMessages([
         {
-          id: `assistant-${job.job_id}`,
+          id: `assistant-${queue.job_id}`,
           role: "assistant",
           label: "Shipyard",
-          text: job.status === "queued" ? "Queued." : "Working.",
-          badge: job.status === "queued" ? "Queued" : "Working",
+          text: isQueued ? "Queued." : "Working.",
+          badge: isQueued ? null : "Working",
           badgeTone: "neutral",
-          meta: [job.current_task ? `Task: ${job.current_task}` : null].filter(Boolean),
+          meta: [currentTask ? `Task: ${currentTask}` : null].filter(Boolean),
         },
       ]);
     }
@@ -1122,7 +1216,10 @@ Shift+Enter adds a new line.'></textarea>
     function renderQueueTimeline(data) {
       const candidates = [data?.session, data?.active, ...(data?.queued || [])]
         .filter(Boolean)
-        .filter((job, index, items) => items.findIndex((item) => item.job_id === job.job_id) === index)
+        .filter((job, index, items) => {
+          const jobId = job?.queue?.job_id || job?.job_id;
+          return items.findIndex((item) => (item?.queue?.job_id || item?.job_id) === jobId) === index;
+        })
         .slice(0, 3);
 
       if (!candidates.length) {
@@ -1131,16 +1228,17 @@ Shift+Enter adds a new line.'></textarea>
       }
 
       queueTimelineEl.innerHTML = candidates.map((job) => {
-        const events = Array.isArray(job.task_events) ? job.task_events.slice(-6).reverse() : [];
-        const sessionLabel = job.session_id || job.job_id || "run";
+        const queue = job?.queue || {};
+        const events = Array.isArray(queue.task_events) ? queue.task_events.slice(-6).reverse() : [];
+        const sessionLabel = job.session_id || queue.job_id || "run";
         return `
           <div class="timeline-card">
             <div class="timeline-head">
               <div>
                 <div class="timeline-title">${sessionLabel}</div>
-                <div class="timeline-subtitle">${job.status || "unknown"}${job.current_task ? ` · ${job.current_task}` : ""}</div>
+                <div class="timeline-subtitle">${job.status || "unknown"}${queue.current_task ? ` · ${queue.current_task}` : ""}</div>
               </div>
-              <span class="route-badge">${job.result_status || job.status || "pending"}</span>
+              <span class="route-badge">${queue.result_status || job.status || "pending"}</span>
             </div>
             ${events.length ? `
               <div class="timeline-events">
@@ -1313,6 +1411,14 @@ Shift+Enter adds a new line.'></textarea>
           tone: "good"
         };
       }
+      if (status === "observed") {
+        return {
+          title: "Observation completed.",
+          subtitle: "The latest tool action completed without a recorded error.",
+          pill: "observed",
+          tone: "good"
+        };
+      }
       return {
         title: `Run finished with ${status}.`,
         subtitle: "Use the side panel if you need more detail.",
@@ -1326,6 +1432,55 @@ Shift+Enter adds a new line.'></textarea>
       return textOrDash(value ?? fallback);
     }
 
+    function summarizeToolOutput(toolOutput) {
+      if (!toolOutput || typeof toolOutput !== "object") return [];
+      const tool = toolOutput.tool;
+      if (tool === "run_command") {
+        const lines = [
+          toolOutput.command ? `Command: ${toolOutput.command}` : null,
+          Number.isInteger(toolOutput.returncode) ? `Exit: ${toolOutput.returncode}` : null,
+        ];
+        if (toolOutput.stdout) lines.push(`Stdout: ${String(toolOutput.stdout).trim().slice(0, 240)}`);
+        if (toolOutput.stderr) lines.push(`Stderr: ${String(toolOutput.stderr).trim().slice(0, 240)}`);
+        return lines.filter(Boolean);
+      }
+      if (tool === "read_file") {
+        return [
+          toolOutput.target_path ? `Read: ${toolOutput.target_path}` : null,
+          toolOutput.content ? `Content: ${String(toolOutput.content).slice(0, 240)}` : null,
+        ].filter(Boolean);
+      }
+      if (tool === "list_files") {
+        const count = Array.isArray(toolOutput.files) ? toolOutput.files.length : 0;
+        return [
+          toolOutput.target_path ? `Listed: ${toolOutput.target_path}` : null,
+          count ? `Files: ${count}` : null,
+        ].filter(Boolean);
+      }
+      if (tool === "search_files") {
+        const count = Array.isArray(toolOutput.matches) ? toolOutput.matches.length : 0;
+        return [
+          toolOutput.pattern ? `Pattern: ${toolOutput.pattern}` : null,
+          count ? `Matches: ${count}` : "Matches: 0",
+        ].filter(Boolean);
+      }
+      return [];
+    }
+
+    function summarizePlanSteps(steps) {
+      if (!Array.isArray(steps) || !steps.length) return [];
+      const lines = steps.slice(0, 5).map((step, index) => {
+        const mode = step?.edit_mode ? ` [${step.edit_mode}]` : "";
+        const target = step?.target_path ? ` -> ${String(step.target_path).split("/").pop()}` : "";
+        const instruction = String(step?.instruction || "").trim() || "Unnamed step";
+        return `Plan ${index + 1}: ${instruction}${mode}${target}`;
+      });
+      if (steps.length > 5) {
+        lines.push(`Plan: +${steps.length - 5} more step(s)`);
+      }
+      return lines;
+    }
+
     function renderResultDetails(data) {
       const summary = summarizeResult(data);
       const humanGate = data?.execution?.human_gate || data?.human_gate || {};
@@ -1335,31 +1490,59 @@ Shift+Enter adds a new line.'></textarea>
       const changedFiles = data?.execution?.changed_files || data?.changed_files || [];
       const preview = data?.execution?.file_preview || data?.file_preview;
       const contentHash = data?.execution?.content_hash || data?.content_hash;
+      const toolOutput = data?.execution?.tool_output || data?.tool_output;
+      const planSteps = summarizePlanSteps(data?.steps || []);
       const previewSuffix = data?.execution?.file_preview_truncated || data?.file_preview_truncated ? "..." : "";
       const changedSummary = changedFiles.length
         ? (changedFiles.length === 1 ? `Changed: ${changedFiles[0]}` : `Changed ${changedFiles.length} files`)
         : null;
+      const toolSummary = summarizeToolOutput(toolOutput);
       const sessionId = getActiveSessionId(data) || "session";
       const resultKey = uiState.activeJobId || uiState.lastCompletedJobId || data?.job_id || data?.trace_path || data?.content_hash || `${sessionId}-${resultValue(data, ["execution", "status"], data?.status)}`;
+      const runKeys = [uiState.activeJobId, uiState.lastCompletedJobId, data?.job_id, data?.session_id, sessionId, data?.trace_path];
+      const rememberedIds = lookupRunMessageIds(runKeys);
+      const userMessageId = rememberedIds?.userId || `user-${resultKey}`;
+      const assistantMessageId = rememberedIds?.assistantId || `assistant-${resultKey}`;
+      const submittedInstruction = lookupSubmittedInstruction([
+        uiState.activeJobId,
+        uiState.lastCompletedJobId,
+        data?.job_id,
+        data?.trace_path,
+        data?.session_id,
+        sessionId,
+      ]);
+      const existingUserMessage = findActivityMessage(userMessageId);
+      const renderedInstruction = (
+        existingUserMessage?.text ||
+        submittedInstruction ||
+        (requestInstruction === "—" ? "Submitted instruction" : requestInstruction)
+      );
+      rememberRunMessageIds(runKeys, {userId: userMessageId, assistantId: assistantMessageId});
+      rememberSubmittedInstruction(
+        [uiState.activeJobId, uiState.lastCompletedJobId, data?.job_id, data?.trace_path, data?.session_id, sessionId],
+        renderedInstruction,
+      );
       appendActivityMessages([
         {
-          id: `user-${resultKey}`,
+          id: userMessageId,
           role: "user",
           label: "You",
-          text: requestInstruction === "—" ? "Submitted instruction" : requestInstruction,
+          text: renderedInstruction,
           meta: [],
         },
         {
-          id: `assistant-${resultKey}`,
+          id: assistantMessageId,
           role: "assistant",
           label: "Shipyard",
           text: data?.status === "idle" ? "Write an instruction and Shipyard will handle it here." : (humanGate?.prompt || summary.subtitle),
           badge: summary.pill,
           badgeTone: humanGate?.prompt ? "bad" : summary.tone,
         meta: [
+          ...planSteps,
           targetPath !== "—" ? `Target: ${targetPath}` : null,
           changedSummary,
           preview ? `Preview: ${preview}${previewSuffix}` : null,
+          ...toolSummary,
           nextStep !== "—" && nextStep !== "clarify_request" ? `Next: ${nextStep}` : null,
           contentHash ? `Hash: ${contentHash}` : null,
         ].filter((line) => typeof line === "string"),
@@ -1369,15 +1552,16 @@ Shift+Enter adds a new line.'></textarea>
 
     function renderPendingState(pending) {
       if (!pending?.kind) return;
+      const isQueued = pending.kind === "queued";
       appendActivityMessages([
         {
           id: `pending-${uiState.activeSessionId || "session"}`,
           role: "assistant",
           label: "Shipyard",
           text: pending.title || "Working.",
-          badge: pending.kind === "queued" ? "Queued" : "Working",
+          badge: isQueued ? null : "Working",
           badgeTone: "neutral",
-          meta: [pending.subtitle || "This page was refreshed while Shipyard was working."],
+          meta: [!isQueued ? (pending.subtitle || "This page was refreshed while Shipyard was working.") : null].filter(Boolean),
         },
       ]);
     }
@@ -1480,37 +1664,49 @@ Shift+Enter adds a new line.'></textarea>
       if (!sessionId) return;
       stopSessionPolling();
       sessionPollHandle = window.setInterval(async () => {
-        const queueData = await loadQueueStatus(sessionId);
-        if (uiState.activeJobId) {
-          const terminal = await hydrateActiveRun(uiState.activeJobId, sessionId);
-          if (terminal) {
+        try {
+          const queueData = await loadQueueStatus(sessionId);
+          if (uiState.activeJobId) {
+            const terminal = await hydrateActiveRun(uiState.activeJobId, sessionId);
+            if (terminal) {
+              saveState({pending: null, pendingInstruction: null});
+              stopSessionPolling();
+              Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
+              return;
+            }
+          }
+          const recovered = !uiState.activeJobId ? await hydrateSessionState(sessionId, {quiet: true}) : false;
+          if (recovered && uiState.pending) {
             saveState({pending: null, pendingInstruction: null});
-            await loadGraphStatus();
-            await loadWorkspaceStatus();
-            await loadSessions();
             stopSessionPolling();
+            Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
             return;
           }
-        }
-        const recovered = !uiState.activeJobId ? await hydrateSessionState(sessionId, {quiet: true}) : false;
-        if (recovered && uiState.pending) {
-          saveState({pending: null, pendingInstruction: null});
-          await loadGraphStatus();
-          await loadWorkspaceStatus();
-          await loadSessions();
-          stopSessionPolling();
-          return;
-        }
-        if (uiState.pending && queueData?.session) {
-          if (!uiState.activeJobId) {
-            renderPendingState({
-              kind: queueData.session.status,
-              title: queueData.session.status === "queued" ? "Queued." : "Working.",
-              subtitle: queueData.session.status === "queued"
-                ? `Waiting behind ${(queueData.queued || []).length} queued run(s).`
-                : "Shipyard is processing this run now.",
-            });
+          if (
+            queueData?.session &&
+            ["completed", "failed"].includes(queueData.session.status) &&
+            !uiState.activeJobId
+          ) {
+            saveState({pending: null, pendingInstruction: null});
+            stopSessionPolling();
+            clearTransientRunMessages();
+            Promise.allSettled([hydrateSessionState(sessionId, {quiet: true}), loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
+            return;
           }
+          if (uiState.pending && queueData?.session) {
+            if (!uiState.activeJobId) {
+              renderPendingState({
+                kind: queueData.session.status,
+                title: queueData.session.status === "queued" ? "Queued." : "Working.",
+                subtitle: queueData.session.status === "queued"
+                  ? `Waiting behind ${(queueData.queued || []).length} queued run(s).`
+                  : "Shipyard is processing this run now.",
+              });
+            }
+          }
+        } catch (error) {
+          console.error("Shipyard polling failed", error);
+          stopSessionPolling();
         }
       }, 2000);
     }
@@ -1531,9 +1727,20 @@ Shift+Enter adds a new line.'></textarea>
 
       const terminal = job.status === "completed" || job.status === "failed";
       if (terminal) {
-        saveState({activeJobId: null, lastCompletedJobId: job.job_id, pending: null, pendingInstruction: null});
-        if (sessionId || job.session_id) {
-          await hydrateSessionState(sessionId || job.session_id, {quiet: true});
+        const resolvedJobId = job?.queue?.job_id || job?.job_id || null;
+        const resolvedSessionId = sessionId || job.session_id || uiState.activeSessionId || null;
+        saveState({
+          activeJobId: null,
+          lastCompletedJobId: resolvedJobId,
+          pending: null,
+          pendingInstruction: null,
+          activeSessionId: resolvedSessionId,
+          lastResult: job,
+        });
+        renderResultDetails(job);
+        resultEl.textContent = pretty(job);
+        if (resolvedSessionId) {
+          hydrateSessionState(resolvedSessionId, {quiet: true});
         }
         return true;
       }
@@ -1541,7 +1748,7 @@ Shift+Enter adds a new line.'></textarea>
       renderQueuedRun(job, uiState.pendingInstruction || uiState.form?.instruction || "");
 
       saveState({
-        activeJobId: job.job_id,
+        activeJobId: job?.queue?.job_id || job?.job_id,
         activeSessionId: sessionId || job.session_id || uiState.activeSessionId,
       });
       return false;
@@ -1659,7 +1866,7 @@ Shift+Enter adds a new line.'></textarea>
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({session_id: sessionId})
         });
-        const target = `${data.path}/scratch.py`;
+        const target = `${data.path}/file.py`;
         document.getElementById("target_path").value = target;
         document.getElementById("session_id").value = sessionId;
         const context = parseContext();
@@ -1708,11 +1915,17 @@ Shift+Enter adds a new line.'></textarea>
           return;
         }
         const inferredFilename = inferFilenameFromInstruction(instructionText);
-      let targetPath = document.getElementById("target_path").value.trim();
-      if (inferredFilename && isStaleScratchTarget(targetPath)) {
-        targetPath = "";
-        document.getElementById("target_path").value = "";
-      }
+        const explicitScaffoldPrompt = isExplicitScaffoldPrompt(instructionText);
+        let targetPath = document.getElementById("target_path").value.trim();
+        if (explicitScaffoldPrompt) {
+          targetPath = "";
+          document.getElementById("target_path").value = "";
+          delete context.file_hint;
+        }
+        if (inferredFilename && isStaleScratchTarget(targetPath)) {
+          targetPath = "";
+          document.getElementById("target_path").value = "";
+        }
         const functionName = document.getElementById("function_name").value.trim();
         const sessionField = document.getElementById("session_id");
         let sessionId = sessionField.value.trim();
@@ -1746,6 +1959,11 @@ Shift+Enter adds a new line.'></textarea>
           activeSessionId: sessionId,
           pendingInstruction: payload.instruction,
         });
+        rememberSubmittedInstruction([sessionId, `pending-${sessionId}`], payload.instruction);
+        rememberRunMessageIds(
+          [sessionId, `pending-${sessionId}`],
+          {userId: `user-pending-${sessionId}`, assistantId: `assistant-pending-${sessionId}`},
+        );
         appendActivityMessages([
           {
             id: `user-pending-${sessionId}`,
@@ -1772,6 +1990,15 @@ Shift+Enter adds a new line.'></textarea>
         });
         const resolvedSessionId = data?.session_id || sessionId;
         const jobId = data?.job_id || data?.queue_job?.job_id || null;
+        if (jobId) {
+          rememberSubmittedInstruction([jobId, resolvedSessionId], payload.instruction);
+          rememberRunMessageIds(
+            [jobId, resolvedSessionId],
+            {userId: `user-${jobId}`, assistantId: `assistant-${jobId}`},
+          );
+        } else {
+          rememberSubmittedInstruction([resolvedSessionId], payload.instruction);
+        }
         document.getElementById("session_id").value = resolvedSessionId;
         if (jobId) {
           replaceActivityMessageIds([
@@ -1879,9 +2106,6 @@ Shift+Enter adds a new line.'></textarea>
     } else {
       resultEl.textContent = pretty({});
     }
-    if (uiState.pending) {
-      renderPendingState(uiState.pending);
-    }
     if (uiState.activeTab) {
       selectTab(uiState.activeTab);
     }
@@ -1892,8 +2116,29 @@ Shift+Enter adds a new line.'></textarea>
       loadSessions();
       const restoredSessionId = uiState.activeSessionId || getActiveSessionId(uiState.lastResult);
       const restoredJobId = uiState.activeJobId || null;
-      await loadQueueStatus(restoredSessionId);
-      if (restoredJobId) {
+      const queueData = await loadQueueStatus(restoredSessionId);
+      const hasLiveQueuedOrRunning = Boolean(
+        queueData?.active ||
+        ((queueData?.queued || []).length) ||
+        (queueData?.session && ["queued", "running"].includes(queueData.session.status))
+      );
+      if (restoredJobId && !hasLiveQueuedOrRunning) {
+        saveState({
+          activeJobId: null,
+          pending: null,
+          pendingInstruction: null,
+        });
+        clearTransientRunMessages();
+      }
+      if (uiState.pending && hasLiveQueuedOrRunning) {
+        renderPendingState(uiState.pending);
+      } else if (uiState.pending) {
+        clearPendingState();
+      }
+      if (!hasLiveQueuedOrRunning && !restoredJobId) {
+        clearTransientRunMessages();
+      }
+      if (restoredJobId && hasLiveQueuedOrRunning) {
         const terminal = await hydrateActiveRun(restoredJobId, restoredSessionId);
         if (!terminal) {
           startSessionPolling(restoredSessionId);
@@ -1959,7 +2204,23 @@ def queue_instruct(request: InstructionRequest) -> dict[str, Any]:
         from .main import _ensure_session_id
 
         state["session_id"] = _ensure_session_id(None)
+    _write_request_receipt(state)
     return run_queue.enqueue(state)
+
+
+def _write_request_receipt(state: dict[str, Any]) -> None:
+    session_id = str(state.get("session_id") or "unknown")
+    if not session_id.startswith("web-"):
+        return
+    logs_dir = ensure_dir(LOGS_ROOT)
+    payload = {
+        "session_id": session_id,
+        "instruction": str(state.get("instruction") or ""),
+        "status": "accepted",
+        "accepted_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    path = logs_dir / f"latest-{session_id}-request.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 @app.get("/queue/status")

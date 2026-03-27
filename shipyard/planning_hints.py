@@ -55,7 +55,9 @@ def is_stale_scratch_target(value: Any) -> bool:
     if not value:
         return False
     name = str(value).strip().split("/")[-1]
-    return bool(re.fullmatch(r"scratch(?:-[0-9a-f]{6})?\.[A-Za-z0-9]+", name))
+    return bool(
+        re.fullmatch(r"(?:scratch|file)(?:-[0-9a-f]{6})?\.[A-Za-z0-9]+", name)
+    )
 
 
 def infer_copy_count(instruction: str) -> int | None:

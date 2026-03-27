@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .storage_paths import DATA_ROOT
-from .workspaces import create_temp_target_path, get_session_workspace
+from .workspaces import get_session_workspace
 
 
 def _resolve_testing_mode_path(raw_path: str, session_id: str | None) -> tuple[str, str]:
@@ -52,37 +52,4 @@ def resolve_target_path(
             return _resolve_testing_mode_path(str(file_hint), session_id)
         return str(file_hint), "file_hint"
 
-    if edit_mode in {"write_file", "create_files"}:
-        wants_unique = _wants_unique_new_file(instruction or "")
-        generated = create_temp_target_path(
-            session_id=session_id,
-            filename=_infer_filename_from_instruction(instruction or ""),
-            unique=wants_unique,
-        )
-        return str(generated.resolve()), "managed_workspace"
-
     return None, "unresolved"
-
-
-def _infer_filename_from_instruction(instruction: str) -> str:
-    text = instruction.lower()
-    candidates = [
-        (("typescript", "ts code", "ts file"), "scratch.ts"),
-        (("javascript", "js code", "js file"), "scratch.js"),
-        (("python", "py code", "python code"), "scratch.py"),
-        (("html", "webpage", "web page"), "scratch.html"),
-        (("css", "stylesheet"), "scratch.css"),
-        (("json",), "scratch.json"),
-        (("markdown", "md file"), "scratch.md"),
-        (("bash", "shell script", "sh file"), "scratch.sh"),
-        (("sql",), "scratch.sql"),
-    ]
-    for needles, filename in candidates:
-        if any(needle in text for needle in needles):
-            return filename
-    return "scratch.py"
-
-
-def _wants_unique_new_file(instruction: str) -> bool:
-    text = instruction.lower()
-    return any(needle in text for needle in ("new file", "blank file", "empty file", "create a file", "make a file"))

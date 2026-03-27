@@ -8,6 +8,7 @@ from .storage_paths import DATA_ROOT, GRAPH_RUNTIME_ROOT, WORKSPACES_ROOT, ensur
 
 WORKSPACE_ROOT = WORKSPACES_ROOT
 LIVE_GRAPH_RUNTIME_ROOT = GRAPH_RUNTIME_ROOT
+DEFAULT_WORKSPACE_NAME = "default"
 
 
 def get_workspace_root() -> Path:
@@ -34,7 +35,7 @@ def create_temp_workspace(prefix: str = "run") -> Path:
 
 def get_session_workspace(session_id: str | None = None) -> Path:
     root = get_workspace_root()
-    name = (session_id or "default").strip() or "default"
+    name = DEFAULT_WORKSPACE_NAME
     workspace = root / name
     workspace.mkdir(parents=True, exist_ok=True)
     return workspace
@@ -42,7 +43,7 @@ def get_session_workspace(session_id: str | None = None) -> Path:
 
 def create_temp_target_path(
     session_id: str | None = None,
-    filename: str = "scratch.py",
+    filename: str = "file.py",
     unique: bool = False,
 ) -> Path:
     workspace = get_session_workspace(session_id)

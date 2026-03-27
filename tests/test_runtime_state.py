@@ -28,39 +28,74 @@ class RuntimeStateTests(unittest.TestCase):
                 "file_preview": "print('hi')",
                 "content_hash": "abc123",
                 "trace_path": ".shipyard/data/traces/demo.json",
+                "troubleshooting_path": ".shipyard/data/logs/demo-troubleshooting.json",
             }
         )
 
         self.assertEqual(enriched["request"]["instruction"], "write hello")
         self.assertEqual(enriched["plan"]["edit_mode"], "write_file")
-        self.assertEqual(enriched["plan"]["target_path_source"], "explicit_target_path")
+        self.assertEqual(enriched["plan"]["provider"], "openai")
         self.assertEqual(enriched["execution"]["status"], "verified")
         self.assertEqual(enriched["execution"]["changed_files"], ["/tmp/demo.py"])
         self.assertEqual(enriched["execution"]["file_preview"], "print('hi')")
         self.assertEqual(enriched["execution"]["content_hash"], "abc123")
-        self.assertIsNone(enriched["graph"]["sync_attempted"])
         self.assertEqual(enriched["artifacts"]["trace_path"], ".shipyard/data/traces/demo.json")
+        self.assertEqual(
+            enriched["artifacts"]["troubleshooting_path"],
+            ".shipyard/data/logs/demo-troubleshooting.json",
+        )
 
-    def test_enrich_state_sections_exposes_graph_and_spec_summaries(self) -> None:
+    def test_enrich_state_sections_prefers_request_instruction(self) -> None:
+        enriched = enrich_state_sections(
+            {
+                "instruction": "step instruction",
+                "request_instruction": "original user instruction",
+                "status": "edited",
+            }
+        )
+
+        self.assertEqual(enriched["request"]["instruction"], "original user instruction")
+
+    def test_enrich_state_sections_compacts_to_public_schema(self) -> None:
         enriched = enrich_state_sections(
             {
                 "proposal_summary": {"is_valid": True},
-                "code_graph_status": {
-                    "ready": True,
-                    "available": True,
-                    "reason": "ready",
-                    "index_state": {"stale": False},
-                    "live_graph_state": {"populated": True},
-                },
-                "graph_sync": {"attempted": True, "ok": True},
                 "spec_bundle": {"created": True},
             }
         )
 
-        self.assertTrue(enriched["graph"]["ready"])
-        self.assertTrue(enriched["graph"]["live_graph_populated"])
-        self.assertTrue(enriched["graph"]["sync_attempted"])
+        self.assertEqual(sorted(enriched.keys()), ["artifacts", "execution", "human_gate", "plan", "request", "steps", "tasks"])
         self.assertTrue(enriched["artifacts"]["spec_created"])
+
+    def test_enrich_state_sections_includes_tasks(self) -> None:
+        enriched = enrich_state_sections(
+            {
+                "action_plan": {
+                    "actions": [
+                        {
+                            "id": "step-1",
+                            "instruction": "Read main.py",
+                            "edit_mode": "read_file",
+                            "depends_on": [],
+                            "inputs_from": [],
+                            "valid": True,
+                        }
+                    ]
+                },
+                "action_steps": [
+                    {
+                        "id": "step-1",
+                        "instruction": "Read main.py",
+                        "edit_mode": "read_file",
+                        "status": "observed",
+                        "no_op": True,
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(enriched["plan"]["task_count"], 1)
+        self.assertEqual(enriched["tasks"][0]["task_id"], "step-1")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from shipyard.graph import build_graph
+from shipyard.graph import apply_edit, build_graph, plan_edit
+from shipyard.workspaces import get_session_workspace
 
 
 class GraphFlowTests(unittest.TestCase):
@@ -201,9 +202,185 @@ class GraphFlowTests(unittest.TestCase):
                 }
             )
 
+            self.assertEqual(result["status"], "invalid_proposal")
+            self.assertIn("full_file_rewrite=true", result["error"])
+
+    def test_graph_scaffold_files_writes_into_session_workspace_in_testing_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            session_id = "scaffold-session"
+            workspace = get_session_workspace(session_id)
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Create tiny repo files",
+                    "session_id": session_id,
+                    "edit_mode": "scaffold_files",
+                    "files": [
+                        {"path": "main.py", "content": 'print("hi")\n'},
+                        {"path": "config.json", "content": '{"unit":"ms"}\n'},
+                    ],
+                    "preplanned_action": {
+                        "instruction": "Create tiny repo files",
+                        "edit_mode": "scaffold_files",
+                        "files": [
+                            {"path": "main.py", "content": 'print("hi")\n'},
+                            {"path": "config.json", "content": '{"unit":"ms"}\n'},
+                        ],
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                    "context": {"testing_mode": True},
+                }
+            )
+
             self.assertEqual(result["status"], "edited")
-            self.assertEqual(path.read_text(encoding="utf-8"), "fresh")
-            self.assertEqual(result["helper_output"]["edit_context"]["mode"], "write_file")
+            self.assertTrue((workspace / "main.py").exists())
+            self.assertTrue((workspace / "config.json").exists())
+            self.assertTrue(all(str(workspace.resolve()) in path for path in result["changed_files"]))
+
+    def test_apply_edit_replaces_all_anchor_occurrences_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "formatter.py"
+            original = 'return "Average Average"\n'
+            path.write_text(original, encoding="utf-8")
+
+            result = apply_edit(
+                {
+                    "instruction": "Replace Average with Processed everywhere in formatter.py",
+                    "target_path": str(path),
+                    "edit_mode": "anchor",
+                    "anchor": "Average",
+                    "replacement": "Processed",
+                    "occurrence_selector": "all",
+                    "file_before": original,
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
+
+    def test_apply_edit_replaces_pointer_spans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "formatter.py"
+            original = 'return "Average Average"\n'
+            path.write_text(original, encoding="utf-8")
+
+            result = apply_edit(
+                {
+                    "instruction": "Replace Average with Processed everywhere in formatter.py",
+                    "target_path": str(path),
+                    "edit_mode": "anchor",
+                    "anchor": "Average",
+                    "replacement": "Processed",
+                    "pointers": [{"start": 8, "end": 15}, {"start": 16, "end": 23}],
+                    "file_before": original,
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
+
+    def test_apply_edit_repairs_ambiguous_anchor_with_pointer_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "formatter.py"
+            original = 'return "Average Average"\n'
+            path.write_text(original, encoding="utf-8")
+
+            with patch(
+                "shipyard.graph.propose_edit",
+                return_value={
+                    "edit_mode": "anchor",
+                    "anchor": "Average",
+                    "replacement": "Processed",
+                    "pointers": [{"start": 8, "end": 15}, {"start": 16, "end": 23}],
+                },
+            ):
+                result = apply_edit(
+                    {
+                        "instruction": "In formatter.py, change the word Average to Processed everywhere it appears in that file.",
+                        "target_path": str(path),
+                        "edit_mode": "anchor",
+                        "anchor": "Average",
+                        "replacement": "Processed",
+                        "file_before": original,
+                        "context": {},
+                        "proposal_summary": {},
+                    }
+                )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
+            self.assertEqual(result["pointers"], [{"start": 8, "end": 15}, {"start": 16, "end": 23}])
+
+    def test_apply_edit_autocorrects_single_exact_anchor_when_invalid_pointers_are_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "formatter.py"
+            original = 'return "Average latency"\n'
+            path.write_text(original, encoding="utf-8")
+
+            result = apply_edit(
+                {
+                    "instruction": 'Change "Average" to "Processed" in formatter.py',
+                    "target_path": str(path),
+                    "edit_mode": "anchor",
+                    "anchor": "Average",
+                    "replacement": "Processed",
+                    "pointers": [{"start": 0, "end": 7}],
+                    "file_before": original,
+                    "context": {},
+                    "proposal_summary": {},
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed latency"\n')
+            self.assertEqual(result["pointers"], [{"start": 8, "end": 15}])
+
+    def test_plan_edit_refines_preplanned_anchor_from_current_file_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "main.py"
+            path.write_text("alpha\nbeta\nbeta\n", encoding="utf-8")
+
+            with patch(
+                "shipyard.graph.propose_edit",
+                return_value={
+                    "edit_mode": "anchor",
+                    "target_path": str(path),
+                    "anchor": "beta\nbeta\n",
+                    "replacement": "beta\n",
+                    "pointers": [{"start": 6, "end": 16}],
+                    "is_valid": True,
+                    "validation_errors": [],
+                    "provider": "openai",
+                    "provider_reason": "Refined against current file contents.",
+                },
+            ) as propose_mock:
+                result = plan_edit(
+                    {
+                        "instruction": "Remove all repeated beta lines except one.",
+                        "target_path": str(path),
+                        "file_before": "alpha\nbeta\nbeta\n",
+                        "tool_outputs": [{"tool": "read_file", "target_path": str(path), "content": "alpha\nbeta\nbeta\n"}],
+                        "action_plan": {"provider": "openai", "provider_reason": "planned"},
+                        "preplanned_action": {
+                            "instruction": "Edit main.py to remove all repeated beta lines except one.",
+                            "edit_mode": "anchor",
+                            "target_path": str(path),
+                            "anchor": "beta",
+                            "replacement": "beta",
+                            "valid": True,
+                            "validation_errors": [],
+                        },
+                    }
+                )
+
+            propose_mock.assert_called_once()
+            self.assertEqual(result["anchor"], "beta\nbeta\n")
+            self.assertEqual(result["pointers"], [{"start": 6, "end": 16}])
+            self.assertIn("Refined", result["proposal_summary"]["provider_reason"])
 
     def test_graph_supports_unquoted_write_file_instruction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -220,6 +397,162 @@ class GraphFlowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "edited")
             self.assertEqual(path.read_text(encoding="utf-8"), "hello world")
+
+    def test_graph_run_command_returns_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            workspace = get_session_workspace("cmd-demo")
+            (workspace / "main.py").write_text('print("hi")\n', encoding="utf-8")
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Run the program",
+                    "session_id": "cmd-demo",
+                    "edit_mode": "run_command",
+                    "command": "python3 main.py",
+                    "preplanned_action": {
+                        "instruction": "Run the program",
+                        "edit_mode": "run_command",
+                        "command": "python3 main.py",
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "observed")
+            self.assertEqual(result["tool_output"]["tool"], "run_command")
+            self.assertEqual(result["tool_output"]["returncode"], 0)
+
+    def test_graph_verify_command_returns_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            workspace = get_session_workspace("verify-demo")
+            (workspace / "main.py").write_text('print("hi")\n', encoding="utf-8")
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Verify the program",
+                    "session_id": "verify-demo",
+                    "edit_mode": "verify_command",
+                    "command": "python3 main.py",
+                    "preplanned_action": {
+                        "instruction": "Verify the program",
+                        "edit_mode": "verify_command",
+                        "command": "python3 main.py",
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "verified")
+            self.assertEqual(result["tool_output"]["tool"], "verify_command")
+
+    def test_graph_create_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir) / "reports"
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Create reports directory",
+                    "edit_mode": "create_directory",
+                    "target_path": str(directory),
+                    "preplanned_action": {
+                        "instruction": "Create reports directory",
+                        "edit_mode": "create_directory",
+                        "target_path": str(directory),
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertTrue(directory.exists())
+
+    def test_graph_rename_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "report.py"
+            source.write_text("print('hi')\n", encoding="utf-8")
+            destination = Path(tmpdir) / "reporter.py"
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Rename report.py",
+                    "edit_mode": "rename_file",
+                    "source_path": str(source),
+                    "destination_path": str(destination),
+                    "target_path": str(source),
+                    "preplanned_action": {
+                        "instruction": "Rename report.py",
+                        "edit_mode": "rename_file",
+                        "source_path": str(source),
+                        "destination_path": str(destination),
+                        "target_path": str(source),
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertTrue(destination.exists())
+            self.assertFalse(source.exists())
+
+    def test_graph_list_files_allows_directory_target_without_preread_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            workspace = get_session_workspace("list-demo")
+            (workspace / "main.py").write_text('print("hi")\n', encoding="utf-8")
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Inspect the current tiny repo files before editing",
+                    "session_id": "list-demo",
+                    "edit_mode": "list_files",
+                    "target_path": str(workspace),
+                    "preplanned_action": {
+                        "instruction": "Inspect the current tiny repo files before editing",
+                        "edit_mode": "list_files",
+                        "target_path": str(workspace),
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "observed")
+            self.assertEqual(result["tool_output"]["tool"], "list_files")
+            self.assertIn("main.py", result["tool_output"]["files"])
+
+    def test_graph_read_file_blocks_directory_target_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Read the directory",
+                    "edit_mode": "read_file",
+                    "target_path": str(root),
+                    "preplanned_action": {
+                        "instruction": "Read the directory",
+                        "edit_mode": "read_file",
+                        "target_path": str(root),
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "edit_blocked")
+            self.assertIn("Target file was not found for read_file.", result["error"])
 
     def test_graph_supports_copy_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -243,34 +576,36 @@ class GraphFlowTests(unittest.TestCase):
             self.assertTrue(result["proposal_summary"]["is_valid"])
 
     def test_graph_write_file_without_target_creates_managed_workspace_file(self) -> None:
-        result = build_graph().invoke(
-            {
-                "instruction": 'write "hello world" to file',
-                "proposal_mode": "heuristic",
-            }
-        )
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            result = build_graph().invoke(
+                {
+                    "instruction": 'write "hello world" to file',
+                    "proposal_mode": "heuristic",
+                }
+            )
 
-        target_path = Path(result["target_path"])
-        self.assertEqual(result["status"], "edited")
-        self.assertTrue(target_path.exists())
-        self.assertEqual(target_path.read_text(encoding="utf-8"), "hello world")
-        self.assertIn(".shipyard/data/workspace/", str(target_path))
+            self.assertEqual(result["status"], "invalid_proposal")
+            self.assertIn("Missing target_path.", result["error"])
 
-    def test_graph_make_new_file_creates_blank_managed_workspace_file(self) -> None:
-        result = build_graph().invoke(
-            {
-                "instruction": "make a new file",
-                "proposal_mode": "heuristic",
-            }
-        )
+    def test_graph_make_new_file_without_target_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT",
+            Path(tmpdir) / "workspaces",
+        ):
+            result = build_graph().invoke(
+                {
+                    "instruction": "make a new file",
+                    "proposal_mode": "heuristic",
+                }
+            )
 
-        target_path = Path(result["target_path"])
-        self.assertEqual(result["status"], "edited")
-        self.assertTrue(target_path.exists())
-        self.assertEqual(target_path.read_text(encoding="utf-8"), "")
-        self.assertEqual(result["proposal_summary"]["edit_mode"], "write_file")
+            self.assertEqual(result["status"], "invalid_proposal")
+            self.assertIn("Missing target_path.", result["error"])
 
-    def test_graph_make_multiple_new_files_creates_blank_managed_workspace_files(self) -> None:
+    def test_graph_make_multiple_new_files_without_target_is_blocked(self) -> None:
         result = build_graph().invoke(
             {
                 "instruction": "make 2 new files",
@@ -279,14 +614,8 @@ class GraphFlowTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(result["status"], "edited")
-        self.assertEqual(result["proposal_summary"]["edit_mode"], "create_files")
-        self.assertEqual(result["proposal_summary"]["quantity"], 2)
-        self.assertEqual(len(result["changed_files"]), 2)
-        for created_path in result["changed_files"]:
-            path = Path(created_path)
-            self.assertTrue(path.exists())
-            self.assertEqual(path.read_text(encoding="utf-8"), "")
+        self.assertEqual(result["status"], "invalid_proposal")
+        self.assertIn("Missing target_path.", result["error"])
 
     def test_graph_create_files_can_focus_content_on_numbered_file(self) -> None:
         result = build_graph().invoke(
@@ -307,6 +636,38 @@ class GraphFlowTests(unittest.TestCase):
         self.assertEqual(by_name["file1.txt"], "")
         self.assertEqual(by_name["file2.txt"], "")
         self.assertEqual(by_name["file4.txt"], "")
+
+    def test_graph_supports_preplanned_scaffold_files_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_path = Path(tmpdir) / "main.py"
+            config_path = Path(tmpdir) / "config.json"
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Create a tiny repo with main.py and config.json",
+                    "edit_mode": "scaffold_files",
+                    "files": [
+                        {"path": str(main_path), "content": "print('hi')\n"},
+                        {"path": str(config_path), "content": "{}\n"},
+                    ],
+                    "preplanned_action": {
+                        "instruction": "Create a tiny repo with main.py and config.json",
+                        "edit_mode": "scaffold_files",
+                        "files": [
+                            {"path": str(main_path), "content": "print('hi')\n"},
+                            {"path": str(config_path), "content": "{}\n"},
+                        ],
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertTrue(main_path.exists())
+            self.assertTrue(config_path.exists())
+            self.assertEqual(main_path.read_text(encoding="utf-8"), "print('hi')\n")
+            self.assertEqual(config_path.read_text(encoding="utf-8"), "{}\n")
 
     def test_graph_write_file_creates_missing_parent_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

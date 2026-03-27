@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .runtime_state import enrich_state_sections
 from .storage_paths import SESSIONS_ROOT, ensure_dir
 from .state import ShipyardState
 
@@ -15,6 +16,7 @@ class SessionStore:
         ensure_dir(self.root)
 
     def append_run(self, state: ShipyardState) -> str:
+        public_state = state if {"request", "plan", "execution", "artifacts"}.issubset(state.keys()) else enrich_state_sections(state)
         session_id = state.get("session_id", "unknown")
         session_dir = self.root / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -22,25 +24,19 @@ class SessionStore:
         history_path = session_dir / "history.jsonl"
         payload = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "instruction": state.get("instruction"),
-            "status": state.get("status"),
-            "edit_mode": state.get("edit_mode"),
-            "proposal_provider": state.get("proposal_summary", {}).get("provider"),
-            "proposal_valid": state.get("proposal_summary", {}).get("is_valid"),
-            "target_path": state.get("target_path"),
-            "changed_files": state.get("changed_files", []),
-            "content_hash": state.get("content_hash"),
-            "error": state.get("error"),
-            "trace_path": state.get("trace_path"),
-            "snapshot_path": state.get("snapshot_path"),
-            "code_graph_ready": state.get("code_graph_status", {}).get("ready"),
-            "code_graph_refresh_required": state.get("code_graph_status", {}).get("refresh_required"),
+            "instruction": public_state.get("request", {}).get("instruction"),
+            "status": public_state.get("status"),
+            "changed_files": public_state.get("execution", {}).get("changed_files", []),
+            "content_hash": public_state.get("execution", {}).get("content_hash"),
+            "error": public_state.get("execution", {}).get("error"),
+            "trace_path": public_state.get("artifacts", {}).get("trace_path"),
+            "snapshot_path": public_state.get("artifacts", {}).get("snapshot_path"),
         }
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
         latest_path = session_dir / "latest_state.json"
-        latest_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        latest_path.write_text(json.dumps(public_state, indent=2, sort_keys=True), encoding="utf-8")
         return str(session_dir)
 
     def load_latest_state(self, session_id: str) -> ShipyardState | None:
@@ -68,13 +64,9 @@ class SessionStore:
                     {
                         "session_id": session_dir.name,
                         "status": latest.get("status"),
-                        "instruction": latest.get("instruction"),
-                        "edit_mode": latest.get("edit_mode"),
-                        "changed_files": latest.get("changed_files", []),
-                        "content_hash": latest.get("content_hash"),
-                        "proposal_provider": latest.get("proposal_summary", {}).get("provider"),
-                        "proposal_valid": latest.get("proposal_summary", {}).get("is_valid"),
-                        "code_graph_refresh_required": latest.get("code_graph_status", {}).get("refresh_required"),
+                        "instruction": latest.get("request", {}).get("instruction"),
+                        "changed_files": latest.get("execution", {}).get("changed_files", []),
+                        "content_hash": latest.get("execution", {}).get("content_hash"),
                     }
                 )
         return sessions

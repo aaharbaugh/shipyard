@@ -46,7 +46,36 @@ class RunQueueTests(unittest.TestCase):
 
         status = queue.get_status("two")
         self.assertEqual(status["session"]["status"], "completed")
-        self.assertEqual(status["session"]["result_status"], "edited")
+        self.assertEqual(status["session"]["queue"]["result_status"], "edited")
+
+    def test_queue_tracks_planning_running_and_blocked_states(self) -> None:
+        def runner(state, cb):
+            cb("planning", {"instruction": state["instruction"]})
+            cb("lead_agent", {"instruction": "mutate", "step_index": 1, "step_count": 1})
+            return {"status": "invalid_proposal", "error": "bad plan"}
+
+        queue = RunQueue(runner)
+        queued = queue.enqueue({"session_id": "demo", "instruction": "do thing"})
+        self.assertEqual(queued["status"], "queued")
+
+        deadline = time.time() + 3
+        seen_planning = False
+        while time.time() < deadline:
+            status = queue.get_status("demo")
+            session = status.get("session", {})
+            if session.get("status") == "planning":
+                seen_planning = True
+            if session.get("status") == "blocked":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("Queue did not reach blocked state.")
+
+        self.assertTrue(
+            seen_planning
+            or any(event["event"] == "planning" for event in status["session"]["queue"]["task_events"])
+        )
+        self.assertEqual(status["session"]["queue"]["state"], "blocked")
 
 
 if __name__ == "__main__":

@@ -27,12 +27,25 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
         )
 
     explicit_files = extract_explicit_filenames(instruction)
+    action_ids = [str(action.get("id")) for action in actions if action.get("id")]
+    if len(action_ids) != len(set(action_ids)):
+        errors.append("Action plan contains duplicate step ids.")
+    known_ids = set(action_ids)
+    for index, action in enumerate(actions, start=1):
+        for dependency in list(action.get("depends_on", []) or []):
+            if dependency not in known_ids:
+                errors.append(f"Action {index} depends on unknown step id `{dependency}`.")
+        for dependency in list(action.get("inputs_from", []) or []):
+            if dependency not in known_ids:
+                errors.append(f"Action {index} references unknown inputs_from step id `{dependency}`.")
     if explicit_files:
-        covered_files = {
-            Path(str(action.get("target_path", ""))).name
-            for action in actions
-            if action.get("target_path")
-        }
+        covered_files: set[str] = set()
+        for action in actions:
+            if action.get("target_path"):
+                covered_files.add(Path(str(action.get("target_path"))).name)
+            for file_spec in (action.get("files") or []):
+                if isinstance(file_spec, dict) and file_spec.get("path"):
+                    covered_files.add(Path(str(file_spec.get("path"))).name)
         missing_files = [name for name in explicit_files if name not in covered_files]
         if missing_files:
             errors.append(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .planning_hints import extract_explicit_filenames
 from .workspaces import get_session_workspace
 
 
@@ -54,6 +55,32 @@ def build_repo_context_lines(
                     lines.append("Target siblings: " + ", ".join(sibling_files))
 
     return lines
+
+
+def build_existing_file_context_lines(
+    session_id: str | None,
+    instruction: str,
+    max_files: int = 4,
+    max_chars: int = 700,
+) -> list[str]:
+    workspace = get_session_workspace(session_id).resolve()
+    lines: list[str] = []
+    for name in extract_explicit_filenames(instruction)[:max_files]:
+        candidate = workspace / name
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        content = candidate.read_text(encoding="utf-8")
+        snippet = content[:max_chars]
+        if len(content) > max_chars:
+            snippet = snippet.rstrip() + "\n..."
+        lines.append(f"Existing file: {name}")
+        lines.append(snippet)
+    return lines
+
+
+def any_explicit_files_exist(session_id: str | None, instruction: str) -> bool:
+    workspace = get_session_workspace(session_id).resolve()
+    return any((workspace / name).exists() for name in extract_explicit_filenames(instruction))
 
 
 def _collect_relative_files(root: Path, base: Path, limit: int) -> list[str]:

@@ -6,18 +6,50 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Callable
 
+from .runtime_state import build_public_job
 from .router import route_message
 from .state import ShipyardState
 
 
 TASK_LABELS = {
     "accepted": "Accepted",
+    "planning": "Planning",
     "spec_bundle": "Spec Check",
     "lead_agent": "Lead Agent",
+    "step_retry": "Retrying",
+    "verifying": "Verifying",
     "result_ready": "Edit Result",
     "graph_sync": "Graph Sync",
     "persisting": "Persisting",
     "completed": "Completed",
+}
+
+EVENT_TO_STATUS = {
+    "accepted": "queued",
+    "planning": "planning",
+    "spec_bundle": "planning",
+    "lead_agent": "running",
+    "step_retry": "running",
+    "verifying": "verifying",
+    "result_ready": "running",
+    "graph_sync": "running",
+    "persisting": "running",
+}
+
+RESULT_TO_QUEUE_STATUS = {
+    "verified": "completed",
+    "edited": "completed",
+    "observed": "completed",
+    "invalid_action_plan": "blocked",
+    "invalid_proposal": "blocked",
+    "edit_blocked": "blocked",
+    "graph_unavailable": "blocked",
+    "awaiting_edit_spec": "blocked",
+    "verification_failed": "failed",
+    "failed_after_retries": "failed",
+    "failed": "failed",
+    "blocked": "blocked",
+    "cancelled": "cancelled",
 }
 
 
@@ -46,6 +78,7 @@ class RunQueue:
             "target_path": state.get("target_path"),
             "error": None,
             "current_task": "Waiting",
+            "queue_state": "queued",
             "task_events": [],
             "agents": _infer_agents(state),
             "routing": route_message(
@@ -83,6 +116,7 @@ class RunQueue:
             "target_path": result.get("target_path"),
             "error": result.get("error"),
             "current_task": "Completed",
+            "queue_state": "completed" if result.get("status") not in {"failed", "invalid_proposal", "edit_blocked", "blocked"} else "failed",
             "task_events": list(result.get("task_events", [])),
             "agents": _infer_agents(state),
             "routing": route_message(
@@ -136,18 +170,23 @@ class RunQueue:
                 job_id = self._queue.popleft()
                 self._active_job_id = job_id
                 job = self._jobs[job_id]
-                job["status"] = "running"
+                job["status"] = "planning"
+                job["queue_state"] = "planning"
                 job["started_at"] = datetime.now().isoformat(timespec="seconds")
                 job["current_task"] = "Accepted"
 
             try:
                 result = self._runner(job["state"], lambda event, payload: self._record_progress(job_id, event, payload))
-                job["status"] = "completed"
+                job["result"] = result
+                job["status"] = RESULT_TO_QUEUE_STATUS.get(result.get("status"), "completed")
+                job["queue_state"] = job["status"]
                 job["result_status"] = result.get("status")
-                job["target_path"] = result.get("target_path")
-                job["error"] = result.get("error")
+                job["target_path"] = result.get("execution", {}).get("target_path") or result.get("target_path")
+                job["error"] = result.get("execution", {}).get("error") or result.get("error")
+                self._record_progress(job_id, "completed", {"status": result.get("status"), "error": job["error"]})
             except Exception as exc:
                 job["status"] = "failed"
+                job["queue_state"] = "failed"
                 job["error"] = str(exc)
                 self._record_progress(job_id, "completed", {"status": "failed", "error": str(exc)})
             finally:
@@ -173,6 +212,10 @@ class RunQueue:
                 return
             label = TASK_LABELS.get(event, event.replace("_", " ").title())
             job["current_task"] = label
+            next_status = EVENT_TO_STATUS.get(event)
+            if next_status:
+                job["status"] = next_status
+                job["queue_state"] = next_status
             task_events = list(job.get("task_events", []))
             task_events.append(
                 {
@@ -196,20 +239,4 @@ def _infer_agents(state: ShipyardState) -> list[str]:
 
 
 def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
-    if job is None:
-        return None
-    return {
-        "job_id": job.get("job_id"),
-        "session_id": job.get("session_id"),
-        "status": job.get("status"),
-        "created_at": job.get("created_at"),
-        "started_at": job.get("started_at"),
-        "finished_at": job.get("finished_at"),
-        "result_status": job.get("result_status"),
-        "target_path": job.get("target_path"),
-        "error": job.get("error"),
-        "current_task": job.get("current_task"),
-        "task_events": job.get("task_events", []),
-        "agents": job.get("agents", []),
-        "routing": job.get("routing", {}),
-    }
+    return build_public_job(job)

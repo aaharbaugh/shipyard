@@ -23,7 +23,7 @@ class ActionNormalizationTests(unittest.TestCase):
         self.assertEqual(action["edit_mode"], "rename_symbol")
         self.assertTrue(action["valid"])
 
-    def test_normalize_action_promotes_add_generation_to_append(self) -> None:
+    def test_normalize_action_keeps_model_declared_edit_mode(self) -> None:
         action = normalize_action(
             {
                 "instruction": "add a random algorithm to scratch.py",
@@ -35,7 +35,101 @@ class ActionNormalizationTests(unittest.TestCase):
             provider_reason="planned",
         )
 
-        self.assertEqual(action["edit_mode"], "append")
+        self.assertEqual(action["edit_mode"], "write_file")
+        self.assertTrue(action["valid"])
+
+    def test_normalize_action_supports_scaffold_files(self) -> None:
+        action = normalize_action(
+            {
+                "instruction": "scaffold tiny repo",
+                "edit_mode": "scaffold_files",
+                "files": [
+                    {"path": "main.py", "content": "print('hi')\n"},
+                    {"path": "config.json", "content": "{}\n"},
+                ],
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["edit_mode"], "scaffold_files")
+        self.assertTrue(action["valid"])
+
+    def test_normalize_action_accepts_search_and_replace_aliases(self) -> None:
+        action = normalize_action(
+            {
+                "instruction": "update formatter.py",
+                "edit_mode": "anchor",
+                "target_path": "formatter.py",
+                "search_text": "old text",
+                "replace_text": "new text",
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["anchor"], "old text")
+        self.assertEqual(action["replacement"], "new text")
+        self.assertTrue(action["valid"])
+
+    def test_normalize_action_supports_run_command(self) -> None:
+        action = normalize_action(
+            {
+                "instruction": "Run the program",
+                "edit_mode": "run_command",
+                "command": "python3 main.py",
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["edit_mode"], "run_command")
+        self.assertEqual(action["command"], "python3 main.py")
+        self.assertTrue(action["valid"])
+
+    def test_normalize_action_supports_dependency_metadata(self) -> None:
+        action = normalize_action(
+            {
+                "id": "step-2",
+                "instruction": "Verify the repo",
+                "action_class": "verify",
+                "edit_mode": "verify_command",
+                "target_path": "main.py",
+                "command": "python3 main.py",
+                "depends_on": ["step-1"],
+                "inputs_from": ["step-1"],
+                "timeout_seconds": 15,
+                "max_retries": 2,
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["id"], "step-2")
+        self.assertEqual(action["action_class"], "verify")
+        self.assertEqual(action["depends_on"], ["step-1"])
+        self.assertEqual(action["inputs_from"], ["step-1"])
+        self.assertTrue(action["valid"])
+
+    def test_normalize_action_supports_move_file(self) -> None:
+        action = normalize_action(
+            {
+                "instruction": "Rename report.py to reporter.py",
+                "edit_mode": "rename_file",
+                "target_path": "report.py",
+                "source_path": "report.py",
+                "destination_path": "reporter.py",
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["edit_mode"], "rename_file")
         self.assertTrue(action["valid"])
 
 

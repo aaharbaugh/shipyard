@@ -29,6 +29,12 @@ from .state import ShipyardState
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _normalize_pointer_payload(value: Any) -> list[dict[str, int]] | None:
+    if value in (None, "", []):
+        return None
+    return value
+
+
 def propose_edit(state: ShipyardState) -> dict[str, Any]:
     explicit_mode = (state.get("proposal_mode") or "").strip().lower()
     if explicit_mode == "heuristic":
@@ -250,6 +256,7 @@ def _normalize_openai_proposal(parsed: dict[str, Any], state: ShipyardState) -> 
         "replacement": replacement,
         "quantity": parsed.get("quantity"),
         "copy_count": parsed.get("copy_count"),
+        "pointers": _normalize_pointer_payload(parsed.get("pointers")),
         "edit_mode": edit_mode,
         "occurrence_selector": parsed.get("occurrence_selector") or parse_occurrence_selector(state.get("instruction", "")),
     }

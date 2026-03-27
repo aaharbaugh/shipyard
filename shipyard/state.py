@@ -15,6 +15,40 @@ class RuntimeContext(TypedDict, total=False):
     helper_notes: str
     function_name: str
     occurrence_selector: str
+    pointers: list[dict[str, int]]
+    tool_outputs: list[dict[str, Any]]
+
+
+class StepSection(TypedDict, total=False):
+    id: str
+    instruction: str
+    action_class: str
+    edit_mode: str
+    target_path: str
+    anchor: str
+    pattern: str
+    command: str
+    pointers: list[dict[str, int]]
+    replacement_preview: str
+    depends_on: list[str]
+    inputs_from: list[str]
+    status: str
+    changed_files: list[str]
+    no_op: bool
+    timeout_seconds: int
+    max_retries: int
+
+
+class TaskSection(TypedDict, total=False):
+    task_id: str
+    role: str
+    goal: str
+    allowed_actions: list[str]
+    status: str
+    result: dict[str, Any]
+    artifacts: dict[str, Any]
+    depends_on: list[str]
+    inputs_from: list[str]
 
 
 class RequestSection(TypedDict, total=False):
@@ -35,11 +69,22 @@ class PlanSection(TypedDict, total=False):
     replacement: str
     quantity: int
     copy_count: int
+    files: list[dict[str, Any]]
+    pattern: str
+    command: str
+    source_path: str
+    destination_path: str
+    paths: list[str]
+    pointers: list[dict[str, int]]
     occurrence_selector: str
+    action_class: str
+    timeout_seconds: int
+    max_retries: int
     provider: str
     provider_reason: str
     valid: bool
     validation_errors: list[str]
+    task_count: int
 
 
 class ExecutionSection(TypedDict, total=False):
@@ -55,6 +100,8 @@ class ExecutionSection(TypedDict, total=False):
     file_preview: str
     file_preview_truncated: bool
     content_hash: str
+    no_op: bool
+    tool_output: dict[str, Any]
 
 
 class VerificationSection(TypedDict, total=False):
@@ -85,6 +132,7 @@ class ActionPlanSection(TypedDict, total=False):
     actions: list[dict[str, Any]]
     provider: str
     provider_reason: str
+    tasks: list[TaskSection]
 
 
 class ShipyardState(TypedDict, total=False):
@@ -95,6 +143,10 @@ class ShipyardState(TypedDict, total=False):
     replacement: str
     quantity: int
     copy_count: int
+    files: list[dict[str, Any]]
+    pattern: str
+    command: str
+    pointers: list[dict[str, int]]
     occurrence_selector: str
     proposal_mode: str
     proposal_model: str
@@ -121,13 +173,20 @@ class ShipyardState(TypedDict, total=False):
     file_preview: str
     file_preview_truncated: bool
     content_hash: str
+    no_op: bool
+    tool_output: dict[str, Any]
+    tool_outputs: list[dict[str, Any]]
     graph_sync: dict[str, Any]
     spec_bundle: dict[str, Any]
     action_plan: ActionPlanSection
+    preplanned_action: dict[str, Any]
     instruction_steps: list[str]
+    action_steps: list[dict[str, Any]]
+    tasks: list[TaskSection]
     human_gate: HumanGateSection
     request: RequestSection
     plan: PlanSection
+    steps: list[StepSection]
     execution: ExecutionSection
     verification: VerificationSection
     graph: GraphSection
