@@ -88,6 +88,9 @@ def build_public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
             "error": job.get("error"),
         }
     )
+    queue_tasks = [task for task in list(job.get("tasks", []) or []) if isinstance(task, dict)]
+    if queue_tasks:
+        base["tasks"] = _merge_public_tasks(base.get("tasks", []), queue_tasks)
     return _compact_object(base)
 
 
@@ -143,6 +146,11 @@ def _build_steps(state: ShipyardState) -> list[dict[str, Any]]:
 
 
 def _build_tasks(state: ShipyardState) -> list[dict[str, Any]]:
+    explicit_tasks = [
+        _compact_object(task)
+        for task in list(state.get("tasks", []) or [])
+        if isinstance(task, dict)
+    ]
     action_plan = dict(state.get("action_plan", {}) or {})
     action_steps = list(state.get("action_steps", []) or [])
     step_by_id = {
@@ -150,30 +158,40 @@ def _build_tasks(state: ShipyardState) -> list[dict[str, Any]]:
         for step in action_steps
         if step.get("id")
     }
-    tasks: list[dict[str, Any]] = []
+    tasks: list[dict[str, Any]] = list(explicit_tasks)
+    seen_task_ids = {str(task.get("task_id")) for task in tasks if task.get("task_id")}
     for index, action in enumerate(action_plan.get("actions", []) or [], start=1):
         if not isinstance(action, dict):
             continue
         task_id = str(action.get("id") or f"step-{index}")
+        if task_id in seen_task_ids:
+            continue
         step = step_by_id.get(task_id, {})
         tasks.append(
             _compact_object(
                 {
                     "task_id": task_id,
-                    "role": "lead-agent",
+                    "role": action.get("role") or "lead-agent",
+                    "agent_type": action.get("agent_type") or "primary",
+                    "parent_task_id": action.get("parent_task_id"),
+                    "child_task_ids": action.get("child_task_ids", []),
                     "goal": action.get("instruction"),
-                    "allowed_actions": [action.get("edit_mode")] if action.get("edit_mode") else [],
+                    "allowed_actions": list(action.get("allowed_actions", [])) or ([action.get("edit_mode")] if action.get("edit_mode") else []),
                     "status": step.get("status") or ("planned" if action.get("valid") else "invalid"),
                     "result": {
                         "changed_files": step.get("changed_files", []),
                         "no_op": step.get("no_op"),
                     },
-                    "artifacts": {},
+                    "artifacts": {
+                        "target_path": step.get("target_path") or action.get("target_path"),
+                        "command": step.get("command") or action.get("command"),
+                    },
                     "depends_on": action.get("depends_on", []),
                     "inputs_from": action.get("inputs_from", []),
                 }
             )
         )
+        seen_task_ids.add(task_id)
     return tasks
 
 
@@ -190,3 +208,22 @@ def _compact_object(value: object) -> Any:
         compacted_list = [_compact_object(item) for item in value]
         return [item for item in compacted_list if item not in (None, "", [], {})]
     return value
+
+
+def _merge_public_tasks(existing: list[dict[str, Any]], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = [dict(task) for task in existing if isinstance(task, dict)]
+    index_by_id = {
+        str(task.get("task_id")): idx
+        for idx, task in enumerate(merged)
+        if task.get("task_id")
+    }
+    for task in incoming:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        if task_id in index_by_id:
+            merged[index_by_id[task_id]] = _compact_object({**merged[index_by_id[task_id]], **task})
+        else:
+            index_by_id[task_id] = len(merged)
+            merged.append(_compact_object(dict(task)))
+    return merged

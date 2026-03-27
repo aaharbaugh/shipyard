@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from shipyard.runtime_state import enrich_state_sections
+from shipyard.runtime_state import build_public_job, enrich_state_sections
 
 
 class RuntimeStateTests(unittest.TestCase):
@@ -70,10 +70,25 @@ class RuntimeStateTests(unittest.TestCase):
     def test_enrich_state_sections_includes_tasks(self) -> None:
         enriched = enrich_state_sections(
             {
+                "tasks": [
+                    {
+                        "task_id": "helper-planner-task",
+                        "role": "helper-planner",
+                        "agent_type": "helper",
+                        "goal": "Inspect and suggest a targeted edit plan",
+                        "allowed_actions": ["read_file", "search_files"],
+                        "status": "planned",
+                    }
+                ],
                 "action_plan": {
                     "actions": [
                         {
                             "id": "step-1",
+                            "role": "helper-planner",
+                            "agent_type": "specialist",
+                            "parent_task_id": "root",
+                            "child_task_ids": ["step-2"],
+                            "allowed_actions": ["read_file"],
                             "instruction": "Read main.py",
                             "edit_mode": "read_file",
                             "depends_on": [],
@@ -94,8 +109,41 @@ class RuntimeStateTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(enriched["plan"]["task_count"], 1)
-        self.assertEqual(enriched["tasks"][0]["task_id"], "step-1")
+        self.assertEqual(enriched["plan"]["task_count"], 2)
+        self.assertEqual(enriched["tasks"][0]["task_id"], "helper-planner-task")
+        self.assertEqual(enriched["tasks"][1]["task_id"], "step-1")
+        self.assertEqual(enriched["tasks"][1]["agent_type"], "specialist")
+        self.assertEqual(enriched["tasks"][1]["parent_task_id"], "root")
+
+    def test_build_public_job_prefers_queue_tasks_for_live_drilldown(self) -> None:
+        job = build_public_job(
+            {
+                "job_id": "job-1",
+                "session_id": "demo",
+                "state": {"instruction": "inspect repo"},
+                "status": "running",
+                "queue_state": "running",
+                "tasks": [
+                    {
+                        "task_id": "run-job-1",
+                        "role": "orchestrator",
+                        "agent_type": "supervisor",
+                        "goal": "inspect repo",
+                        "status": "running",
+                    },
+                    {
+                        "task_id": "step-1",
+                        "role": "lead-agent",
+                        "agent_type": "primary",
+                        "goal": "Read main.py",
+                        "status": "running",
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual(job["tasks"][0]["task_id"], "run-job-1")
+        self.assertEqual(job["tasks"][1]["task_id"], "step-1")
 
 
 if __name__ == "__main__":

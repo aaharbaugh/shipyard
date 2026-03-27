@@ -51,7 +51,7 @@ class RunQueueTests(unittest.TestCase):
     def test_queue_tracks_planning_running_and_blocked_states(self) -> None:
         def runner(state, cb):
             cb("planning", {"instruction": state["instruction"]})
-            cb("lead_agent", {"instruction": "mutate", "step_index": 1, "step_count": 1})
+            cb("lead_agent", {"instruction": "mutate", "step_index": 1, "step_count": 1, "step_id": "step-1"})
             return {"status": "invalid_proposal", "error": "bad plan"}
 
         queue = RunQueue(runner)
@@ -76,6 +76,9 @@ class RunQueueTests(unittest.TestCase):
             or any(event["event"] == "planning" for event in status["session"]["queue"]["task_events"])
         )
         self.assertEqual(status["session"]["queue"]["state"], "blocked")
+        task_ids = [task["task_id"] for task in status["session"]["tasks"]]
+        self.assertIn("run-" + status["session"]["queue"]["job_id"], task_ids)
+        self.assertIn("step-1", task_ids)
 
     def test_queue_can_cancel_queued_job(self) -> None:
         gate = []

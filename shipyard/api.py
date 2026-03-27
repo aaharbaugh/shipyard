@@ -514,6 +514,35 @@ WORKBENCH_HTML = """<!doctype html>
       display: grid;
       gap: 12px;
     }
+    .task-panel {
+      display: grid;
+      gap: 12px;
+    }
+    .task-panel-empty {
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      color: var(--muted);
+      background: var(--soft);
+    }
+    .task-panel-section {
+      display: grid;
+      gap: 10px;
+    }
+    .task-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .task-panel-header h3 {
+      margin: 0;
+      font-size: 0.96rem;
+    }
+    .task-panel-meta {
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
     ul {
       list-style: none;
       padding: 0;
@@ -654,6 +683,77 @@ WORKBENCH_HTML = """<!doctype html>
       gap: 12px;
       font-size: 0.9rem;
     }
+    .message-details {
+      display: grid;
+      gap: 10px;
+    }
+    .task-block {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(15, 23, 42, 0.28);
+    }
+    .task-block-title {
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(226, 232, 240, 0.68);
+      font-weight: 700;
+    }
+    .task-grid {
+      display: grid;
+      gap: 8px;
+    }
+    .task-card {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      background: rgba(255, 255, 255, 0.04);
+    }
+    .task-card-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .task-card-id {
+      font-size: 0.8rem;
+      color: rgba(226, 232, 240, 0.68);
+      font-weight: 700;
+    }
+    .task-card-status {
+      font-size: 0.76rem;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      color: rgba(248, 250, 252, 0.9);
+      background: rgba(255, 255, 255, 0.06);
+    }
+    .task-card-goal {
+      font-size: 0.92rem;
+      line-height: 1.4;
+      color: #f8fafc;
+    }
+    .task-card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      font-size: 0.8rem;
+      color: rgba(226, 232, 240, 0.7);
+    }
+    .task-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      background: rgba(255, 255, 255, 0.05);
+    }
     .meta-line {
       color: var(--muted);
     }
@@ -779,6 +879,7 @@ Shift+Enter adds a new line.'></textarea>
       </div>
       <div class="tab-row">
         <button class="active" data-tab="details">Details</button>
+        <button data-tab="tasks">Tasks</button>
         <button data-tab="graph">Graph</button>
         <button data-tab="sessions">Sessions</button>
         <button data-tab="raw">Raw</button>
@@ -845,6 +946,32 @@ Shift+Enter adds a new line.'></textarea>
           <h3>Queue</h3>
           <div class="queue-live" id="queue_status"></div>
           <div class="queue-timeline" id="queue_timeline"></div>
+        </div>
+      </section>
+
+      <section class="tab-panel" id="tab_tasks">
+        <div class="task-panel">
+          <div class="status">
+            <div>
+              <strong id="tasks_title">No active task graph.</strong>
+              <span id="tasks_subtitle">Run a prompt to inspect tasks, steps, dependencies, and helper-agent work.</span>
+            </div>
+            <div id="tasks_pill" class="pill neutral">Idle</div>
+          </div>
+          <div class="task-panel-section">
+            <div class="task-panel-header">
+              <h3>Task Graph</h3>
+              <span class="task-panel-meta" id="tasks_summary">0 tasks</span>
+            </div>
+            <div id="tasks_block" class="task-panel-empty">No task data yet.</div>
+          </div>
+          <div class="task-panel-section">
+            <div class="task-panel-header">
+              <h3>Live Queue Steps</h3>
+              <span class="task-panel-meta" id="tasks_queue_summary">0 live events</span>
+            </div>
+            <div id="tasks_queue_block" class="task-panel-empty">No live queue activity.</div>
+          </div>
         </div>
       </section>
 
@@ -916,6 +1043,13 @@ Shift+Enter adds a new line.'></textarea>
     const graphConnectivityEl = document.getElementById("graph_connectivity");
     const graphIndexEl = document.getElementById("graph_index");
     const graphLiveEl = document.getElementById("graph_live");
+    const tasksTitleEl = document.getElementById("tasks_title");
+    const tasksSubtitleEl = document.getElementById("tasks_subtitle");
+    const tasksPillEl = document.getElementById("tasks_pill");
+    const tasksSummaryEl = document.getElementById("tasks_summary");
+    const tasksQueueSummaryEl = document.getElementById("tasks_queue_summary");
+    const tasksBlockEl = document.getElementById("tasks_block");
+    const tasksQueueBlockEl = document.getElementById("tasks_queue_block");
     const plannerTitleEl = document.getElementById("planner_title");
     const plannerSubtitleEl = document.getElementById("planner_subtitle");
     const plannerPillEl = document.getElementById("planner_pill");
@@ -1045,6 +1179,7 @@ Shift+Enter adds a new line.'></textarea>
       queueStatusEl.innerHTML = "";
       queueTimelineEl.innerHTML = "";
       resultEl.textContent = pretty({});
+      renderTasksPanel(null, null);
       instructionEl.focus();
     }
 
@@ -1192,6 +1327,7 @@ Shift+Enter adds a new line.'></textarea>
         if (button) button.addEventListener("click", () => cancelRun(activeJobId));
       }
       renderQueueTimeline(data);
+      renderTasksPanel(uiState.lastResult || null, active || session || null);
     }
 
     function renderQueuedRun(job, instruction) {
@@ -1200,17 +1336,32 @@ Shift+Enter adds a new line.'></textarea>
       const state = queue.state || job.status;
       const isQueued = state === "queued";
       const currentTask = queue.current_task && queue.current_task !== "Waiting" ? queue.current_task : null;
+      const tasks = Array.isArray(queue.task_events)
+        ? queue.task_events
+            .filter((event) => event?.payload?.instruction)
+            .slice(-3)
+            .map((event, index) => ({
+              task_id: `live-${index + 1}`,
+              role: "lead-agent",
+              agent_type: "primary",
+              goal: event.payload.instruction,
+              status: event.label || event.event || state,
+              allowed_actions: [],
+            }))
+        : [];
       appendActivityMessages([
         {
           id: `assistant-${queue.job_id}`,
           role: "assistant",
           label: "Shipyard",
           text: isQueued ? "Queued." : (state === "verifying" ? "Verifying." : "Working."),
+          detailsHtml: renderTaskBlock(tasks, []),
           badge: isQueued ? null : state,
           badgeTone: "neutral",
           meta: [currentTask ? `Task: ${currentTask}` : null, queue.state ? `State: ${queue.state}` : null].filter(Boolean),
         },
       ]);
+      renderTasksPanel(uiState.lastResult || null, job);
     }
 
     function summarizeEventPayload(payload) {
@@ -1236,6 +1387,7 @@ Shift+Enter adds a new line.'></textarea>
 
       if (!candidates.length) {
         queueTimelineEl.innerHTML = "";
+        renderTasksPanel(uiState.lastResult || null, null);
         return;
       }
 
@@ -1276,6 +1428,7 @@ Shift+Enter adds a new line.'></textarea>
           <div class="message-label">${message.label}</div>
           <div class="message-bubble">
             <div class="message-text">${message.text}</div>
+            ${message.detailsHtml ? `<div class="message-details">${message.detailsHtml}</div>` : ""}
             ${message.badge ? `<div><span class="pill${message.badgeTone ? ` ${message.badgeTone}` : " neutral"}">${message.badge}</span></div>` : ""}
             ${message.meta && message.meta.length ? `<div class="message-meta">${message.meta.map((item) => `<span class="meta-line">${item}</span>`).join("")}</div>` : ""}
           </div>
@@ -1321,6 +1474,117 @@ Shift+Enter adds a new line.'></textarea>
     function textOrDash(value) {
       if (value === null || value === undefined || value === "") return "—";
       return String(value);
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function renderTaskBlock(tasks, steps) {
+      const taskList = Array.isArray(tasks) ? tasks : [];
+      const stepList = Array.isArray(steps) ? steps : [];
+      if (!taskList.length && !stepList.length) return "";
+      const taskCards = taskList.map((task, index) => {
+        const taskId = task?.task_id || `task-${index + 1}`;
+        const goal = task?.goal || taskId;
+        const status = task?.status || "planned";
+        const bits = [];
+        if (task?.role) bits.push(`<span class="task-chip">role: ${escapeHtml(task.role)}</span>`);
+        if (task?.agent_type) bits.push(`<span class="task-chip">agent: ${escapeHtml(task.agent_type)}</span>`);
+        if (Array.isArray(task?.allowed_actions) && task.allowed_actions.length) {
+          bits.push(`<span class="task-chip">actions: ${escapeHtml(task.allowed_actions.join(", "))}</span>`);
+        }
+        if (Array.isArray(task?.depends_on) && task.depends_on.length) {
+          bits.push(`<span class="task-chip">deps: ${escapeHtml(task.depends_on.join(", "))}</span>`);
+        }
+        if (Array.isArray(task?.inputs_from) && task.inputs_from.length) {
+          bits.push(`<span class="task-chip">inputs: ${escapeHtml(task.inputs_from.join(", "))}</span>`);
+        }
+        if (task?.parent_task_id) {
+          bits.push(`<span class="task-chip">parent: ${escapeHtml(task.parent_task_id)}</span>`);
+        }
+        if (Array.isArray(task?.child_task_ids) && task.child_task_ids.length) {
+          bits.push(`<span class="task-chip">children: ${escapeHtml(task.child_task_ids.join(", "))}</span>`);
+        }
+        return `
+          <div class="task-card">
+            <div class="task-card-top">
+              <div class="task-card-id">${escapeHtml(taskId)}</div>
+              <div class="task-card-status">${escapeHtml(status)}</div>
+            </div>
+            <div class="task-card-goal">${escapeHtml(goal)}</div>
+            ${bits.length ? `<div class="task-card-meta">${bits.join("")}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+      const stepCards = stepList.map((step, index) => {
+        const taskId = step?.id || `step-${index + 1}`;
+        const goal = step?.instruction || taskId;
+        const status = step?.status || step?.edit_mode || "planned";
+        const bits = [];
+        if (step?.action_class) bits.push(`<span class="task-chip">class: ${escapeHtml(step.action_class)}</span>`);
+        if (step?.edit_mode) bits.push(`<span class="task-chip">mode: ${escapeHtml(step.edit_mode)}</span>`);
+        if (step?.target_path) bits.push(`<span class="task-chip">target: ${escapeHtml(String(step.target_path).split("/").pop())}</span>`);
+        if (Array.isArray(step?.depends_on) && step.depends_on.length) {
+          bits.push(`<span class="task-chip">deps: ${escapeHtml(step.depends_on.join(", "))}</span>`);
+        }
+        if (Array.isArray(step?.inputs_from) && step.inputs_from.length) {
+          bits.push(`<span class="task-chip">inputs: ${escapeHtml(step.inputs_from.join(", "))}</span>`);
+        }
+        return `
+          <div class="task-card">
+            <div class="task-card-top">
+              <div class="task-card-id">${escapeHtml(taskId)}</div>
+              <div class="task-card-status">${escapeHtml(status)}</div>
+            </div>
+            <div class="task-card-goal">${escapeHtml(goal)}</div>
+            ${bits.length ? `<div class="task-card-meta">${bits.join("")}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+      return `
+        ${taskCards ? `<div class="task-block"><div class="task-block-title">Tasks</div><div class="task-grid">${taskCards}</div></div>` : ""}
+        ${stepCards ? `<div class="task-block"><div class="task-block-title">Steps</div><div class="task-grid">${stepCards}</div></div>` : ""}
+      `;
+    }
+
+    function renderTasksPanel(resultData = null, queueData = null) {
+      const tasks = Array.isArray(resultData?.tasks) ? resultData.tasks : (Array.isArray(queueData?.tasks) ? queueData.tasks : []);
+      const steps = Array.isArray(resultData?.steps) ? resultData.steps : (Array.isArray(queueData?.steps) ? queueData.steps : []);
+      const queue = queueData?.queue || queueData || {};
+      const liveTasks = Array.isArray(queue.task_events)
+        ? queue.task_events
+            .filter((event) => event?.payload?.instruction)
+            .map((event, index) => ({
+              task_id: `live-${index + 1}`,
+              role: event?.payload?.role || "lead-agent",
+              agent_type: "live",
+              goal: event.payload.instruction,
+              status: event.label || event.event || "pending",
+              allowed_actions: [],
+            }))
+        : [];
+      const queueState = queue?.state || queueData?.status || resultData?.queue?.state || resultData?.status || "idle";
+      const activeCount = tasks.length || steps.length;
+      tasksTitleEl.textContent = activeCount ? "Task graph loaded." : "No active task graph.";
+      tasksSubtitleEl.textContent = activeCount
+        ? "Inspect lead and helper tasks, dependencies, and current execution state."
+        : "Run a prompt to inspect tasks, steps, dependencies, and helper-agent work.";
+      tasksPillEl.textContent = textOrDash(queueState);
+      tasksPillEl.className = `pill ${["completed", "verified", "edited", "observed"].includes(queueState) ? "good" : (["failed", "blocked", "cancelled"].includes(queueState) ? "bad" : "neutral")}`;
+      tasksSummaryEl.textContent = `${tasks.length} task${tasks.length === 1 ? "" : "s"} · ${steps.length} step${steps.length === 1 ? "" : "s"}`;
+      tasksQueueSummaryEl.textContent = `${liveTasks.length} live event${liveTasks.length === 1 ? "" : "s"}`;
+      const taskMarkup = renderTaskBlock(tasks, steps);
+      tasksBlockEl.className = taskMarkup ? "" : "task-panel-empty";
+      tasksBlockEl.innerHTML = taskMarkup || "No task data yet.";
+      const queueMarkup = renderTaskBlock(liveTasks, []);
+      tasksQueueBlockEl.className = queueMarkup ? "" : "task-panel-empty";
+      tasksQueueBlockEl.innerHTML = queueMarkup || "No live queue activity.";
     }
 
     function selectTab(name) {
@@ -1479,31 +1743,6 @@ Shift+Enter adds a new line.'></textarea>
       return [];
     }
 
-    function summarizePlanSteps(steps) {
-      if (!Array.isArray(steps) || !steps.length) return [];
-      const lines = steps.slice(0, 5).map((step, index) => {
-        const mode = step?.edit_mode ? ` [${step.edit_mode}]` : "";
-        const target = step?.target_path ? ` -> ${String(step.target_path).split("/").pop()}` : "";
-        const status = step?.status ? ` {${step.status}}` : "";
-        const deps = Array.isArray(step?.depends_on) && step.depends_on.length ? ` deps:${step.depends_on.join(",")}` : "";
-        const instruction = String(step?.instruction || "").trim() || "Unnamed step";
-        return `Plan ${index + 1}: ${instruction}${mode}${target}${status}${deps}`;
-      });
-      if (steps.length > 5) {
-        lines.push(`Plan: +${steps.length - 5} more step(s)`);
-      }
-      return lines;
-    }
-
-    function summarizeTasks(tasks) {
-      if (!Array.isArray(tasks) || !tasks.length) return [];
-      return tasks.slice(0, 4).map((task, index) => {
-        const status = task?.status ? ` {${task.status}}` : "";
-        const role = task?.role ? ` [${task.role}]` : "";
-        return `Task ${index + 1}: ${String(task?.goal || task?.task_id || "Unnamed task").trim()}${role}${status}`;
-      });
-    }
-
     function renderResultDetails(data) {
       const summary = summarizeResult(data);
       const humanGate = data?.execution?.human_gate || data?.human_gate || {};
@@ -1514,8 +1753,7 @@ Shift+Enter adds a new line.'></textarea>
       const preview = data?.execution?.file_preview || data?.file_preview;
       const contentHash = data?.execution?.content_hash || data?.content_hash;
       const toolOutput = data?.execution?.tool_output || data?.tool_output;
-      const planSteps = summarizePlanSteps(data?.steps || []);
-      const taskSummary = summarizeTasks(data?.tasks || []);
+      const taskBlockHtml = renderTaskBlock(data?.tasks || [], data?.steps || []);
       const previewSuffix = data?.execution?.file_preview_truncated || data?.file_preview_truncated ? "..." : "";
       const changedSummary = changedFiles.length
         ? (changedFiles.length === 1 ? `Changed: ${changedFiles[0]}` : `Changed ${changedFiles.length} files`)
@@ -1559,11 +1797,10 @@ Shift+Enter adds a new line.'></textarea>
           role: "assistant",
           label: "Shipyard",
           text: data?.status === "idle" ? "Write an instruction and Shipyard will handle it here." : (humanGate?.prompt || summary.subtitle),
+          detailsHtml: taskBlockHtml,
           badge: summary.pill,
           badgeTone: humanGate?.prompt ? "bad" : summary.tone,
         meta: [
-          ...planSteps,
-          ...taskSummary,
           targetPath !== "—" ? `Target: ${targetPath}` : null,
           changedSummary,
           preview ? `Preview: ${preview}${previewSuffix}` : null,
@@ -1676,6 +1913,7 @@ Shift+Enter adds a new line.'></textarea>
         renderResultDetails(data);
         resultEl.textContent = pretty(data);
         saveState({lastResult: data, activeSessionId: sessionId});
+        renderTasksPanel(data, data?.queue || null);
         if (!quiet) {
           await loadHistory(sessionId);
         }
@@ -1771,6 +2009,7 @@ Shift+Enter adds a new line.'></textarea>
       }
 
       renderQueuedRun(job, uiState.pendingInstruction || uiState.form?.instruction || "");
+      renderTasksPanel(uiState.lastResult || null, job);
 
       saveState({
         activeJobId: job?.queue?.job_id || job?.job_id,
@@ -1799,11 +2038,13 @@ Shift+Enter adds a new line.'></textarea>
         });
         renderResultDetails(data);
         resultEl.textContent = pretty(data);
+        renderTasksPanel(data, data?.queue || null);
         saveState({lastResult: data, pending: null, form: currentFormState()});
         await loadGraphStatus();
       } catch (error) {
         renderResultDetails({status: "error", error: String(error)});
         resultEl.textContent = pretty({error: String(error)});
+        renderTasksPanel({status: "error", error: String(error)}, null);
         saveState({pending: null, lastResult: {status: "error", error: String(error)}, form: currentFormState()});
       }
     }
@@ -1828,11 +2069,13 @@ Shift+Enter adds a new line.'></textarea>
         });
         renderResultDetails({status: "runtime_cleaned"});
         resultEl.textContent = pretty(data);
+        renderTasksPanel({status: "runtime_cleaned"}, null);
         saveState({lastResult: {status: "runtime_cleaned", ...data}, pending: null, form: currentFormState()});
         await loadSessions();
       } catch (error) {
         renderResultDetails({status: "error", error: String(error)});
         resultEl.textContent = pretty({error: String(error)});
+        renderTasksPanel({status: "error", error: String(error)}, null);
         saveState({pending: null, lastResult: {status: "error", error: String(error)}, form: currentFormState()});
       }
     }
@@ -1866,6 +2109,7 @@ Shift+Enter adds a new line.'></textarea>
         saveState({lastResult: data, activeJobId: null, pending: null, pendingInstruction: null});
         resultEl.textContent = pretty(data);
         renderResultDetails(data);
+        renderTasksPanel(data, data?.queue || null);
         stopSessionPolling();
         await loadQueueStatus(getActiveSessionId(data) || uiState.activeSessionId);
       } catch (error) {
@@ -2075,6 +2319,7 @@ Shift+Enter adds a new line.'></textarea>
             current_task: data?.current_task || "Waiting",
           };
           renderQueuedRun(queueJob, payload.instruction);
+          renderTasksPanel(uiState.lastResult || null, queueJob);
         } else {
           renderResultDetails(data);
         }
@@ -2087,6 +2332,7 @@ Shift+Enter adds a new line.'></textarea>
           lastCompletedJobId: null,
           pendingInstruction: payload.instruction,
         });
+        instructionEl.value = "";
         saveState({form: currentFormState()});
         if (jobId) {
           startSessionPolling(resolvedSessionId);
@@ -2100,6 +2346,7 @@ Shift+Enter adds a new line.'></textarea>
       } catch (error) {
         renderResultDetails({status: "error", error: String(error)});
         resultEl.textContent = pretty({error: String(error)});
+        renderTasksPanel({status: "error", error: String(error)}, null);
         saveState({pending: null, lastResult: {status: "error", error: String(error)}, form: currentFormState()});
         stopSessionPolling();
       } finally {
@@ -2146,8 +2393,10 @@ Shift+Enter adds a new line.'></textarea>
     }
     if (uiState.lastResult) {
       resultEl.textContent = pretty(uiState.lastResult);
+      renderTasksPanel(uiState.lastResult, uiState.lastResult?.queue || null);
     } else {
       resultEl.textContent = pretty({});
+      renderTasksPanel(null, null);
     }
     if (uiState.activeTab) {
       selectTab(uiState.activeTab);

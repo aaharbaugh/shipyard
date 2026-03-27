@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from shipyard.main import (
+    _plan_actions_with_cancellation,
     _maybe_sync_graph,
     _run_action_plan,
     _sanitize_stale_target_request,
@@ -19,6 +21,7 @@ from shipyard.main import (
     run_once,
 )
 from shipyard.main import _attach_file_outcome
+from shipyard.action_planner import PlanningCancelledError
 
 
 class MainInputTests(unittest.TestCase):
@@ -255,6 +258,18 @@ class MainInputTests(unittest.TestCase):
         self.assertIn("boom", result["execution"]["error"])
         self.assertIn("troubleshooting_path", result["artifacts"])
 
+    def test_plan_actions_with_cancellation_raises_cancelled(self) -> None:
+        started = {"ready": False}
+
+        def fake_plan_actions(state):
+            started["ready"] = True
+            time.sleep(2)
+
+        cancel_state = {"cancel_check": lambda: started["ready"]}
+        with patch("shipyard.main.plan_actions", side_effect=fake_plan_actions):
+            with self.assertRaises(PlanningCancelledError):
+                _plan_actions_with_cancellation(cancel_state)
+
     def test_run_action_plan_keeps_edited_status_when_final_step_is_observation(self) -> None:
         app = Mock()
         app.invoke.side_effect = [
@@ -277,6 +292,29 @@ class MainInputTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "edited")
         self.assertFalse(result["no_op"])
+
+    def test_run_action_plan_marks_remaining_steps_skipped_after_failure(self) -> None:
+        app = Mock()
+        app.invoke.side_effect = [
+            {"status": "observed", "no_op": True, "tool_output": {"tool": "read_file"}},
+            {"status": "edit_blocked", "error": "Anchor was not found in the target file.", "no_op": True, "target_path": "/tmp/main.py"},
+        ]
+
+        result = _run_action_plan(
+            app,
+            {"session_id": "demo", "instruction": "inspect edit verify", "request_instruction": "inspect edit verify"},
+            {
+                "actions": [
+                    {"id": "step-1", "instruction": "Read main.py", "edit_mode": "read_file"},
+                    {"id": "step-2", "instruction": "Edit main.py", "edit_mode": "anchor"},
+                    {"id": "step-3", "instruction": "Run main.py", "edit_mode": "run_command"},
+                ]
+            },
+        )
+
+        self.assertEqual(result["action_steps"][0]["status"], "observed")
+        self.assertEqual(result["action_steps"][1]["status"], "edit_blocked")
+        self.assertEqual(result["action_steps"][2]["status"], "skipped")
 
 
 if __name__ == "__main__":

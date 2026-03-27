@@ -54,6 +54,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Side Panel", response.body.decode("utf-8"))
         self.assertIn("LLM planning is active", response.body.decode("utf-8"))
         self.assertIn("Details", response.body.decode("utf-8"))
+        self.assertIn("Tasks", response.body.decode("utf-8"))
         self.assertIn("Graph", response.body.decode("utf-8"))
         self.assertIn("Raw", response.body.decode("utf-8"))
         self.assertIn("Live Graph", response.body.decode("utf-8"))

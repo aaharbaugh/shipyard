@@ -94,6 +94,11 @@ class ActionNormalizationTests(unittest.TestCase):
         action = normalize_action(
             {
                 "id": "step-2",
+                "role": "helper-planner",
+                "agent_type": "specialist",
+                "parent_task_id": "step-1",
+                "child_task_ids": ["step-3"],
+                "allowed_actions": ["verify_command"],
                 "instruction": "Verify the repo",
                 "action_class": "verify",
                 "edit_mode": "verify_command",
@@ -110,6 +115,11 @@ class ActionNormalizationTests(unittest.TestCase):
         )
 
         self.assertEqual(action["id"], "step-2")
+        self.assertEqual(action["role"], "helper-planner")
+        self.assertEqual(action["agent_type"], "specialist")
+        self.assertEqual(action["parent_task_id"], "step-1")
+        self.assertEqual(action["child_task_ids"], ["step-3"])
+        self.assertEqual(action["allowed_actions"], ["verify_command"])
         self.assertEqual(action["action_class"], "verify")
         self.assertEqual(action["depends_on"], ["step-1"])
         self.assertEqual(action["inputs_from"], ["step-1"])

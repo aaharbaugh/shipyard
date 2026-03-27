@@ -6,10 +6,11 @@ import json
 import uuid
 import copy
 import hashlib
+import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .action_planner import plan_actions
+from .action_planner import PlanningCancelledError, plan_actions
 from .graph import build_graph
 from .intent_parser import parse_instruction
 from .langsmith_config import build_langgraph_config
@@ -99,7 +100,8 @@ def run_once(
         spec_bundle = generate_spec_bundle(state.get("session_id"), state.get("instruction", ""))
         if spec_bundle.get("created") or spec_bundle.get("mode"):
             state["spec_bundle"] = spec_bundle
-        action_plan = plan_actions(state)
+        _emit_progress(progress_callback, "planning", {"instruction": state.get("instruction")})
+        action_plan = _plan_actions_with_cancellation(state)
         if not action_plan.get("is_valid", True):
             result = _invalid_action_plan_result(state, action_plan)
             result = _persist_result(session_store, result)
@@ -116,6 +118,15 @@ def run_once(
             if graph_sync.get("status"):
                 result["code_graph_status"] = graph_sync["status"]
         result = _attach_file_outcome(result)
+        result = _persist_result(session_store, result)
+        _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
+        return result
+    except PlanningCancelledError:
+        result = {
+            **state,
+            "status": "cancelled",
+            "error": "Run cancelled.",
+        }
         result = _persist_result(session_store, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
         return result
@@ -206,7 +217,17 @@ def _run_action_plan(
         _emit_progress(
             progress_callback,
             "verifying" if action.get("action_class") == "verify" else "lead_agent",
-            {"instruction": step, "step_index": index, "step_count": len(actions), "step_id": step_id},
+            {
+                "instruction": step,
+                "step_index": index,
+                "step_count": len(actions),
+                "step_id": step_id,
+                "role": _infer_subagent_role(action),
+                "agent_type": _infer_subagent_type(action),
+                "allowed_actions": list(action.get("allowed_actions", [])) or ([action.get("edit_mode")] if action.get("edit_mode") else []),
+                "depends_on": depends_on,
+                "inputs_from": inputs_from,
+            },
         )
         max_retries = int(action.get("max_retries") or (1 if action.get("action_class") in {"inspect", "verify"} else 0))
         attempt = 0
@@ -298,6 +319,28 @@ def _run_action_plan(
         if latest_result.get("status") in {"edited", "verified", "observed"}:
             completed_step_ids.add(step_id)
         if latest_result.get("status") not in {"edited", "verified", "observed"}:
+            for remaining_index, remaining_action in enumerate(actions[index:], start=index + 1):
+                action_steps.append(
+                    {
+                        "id": str(remaining_action.get("id") or f"step-{remaining_index}"),
+                        "instruction": str(remaining_action.get("instruction") or "").strip() or "Pending step",
+                        "action_class": remaining_action.get("action_class"),
+                        "edit_mode": remaining_action.get("edit_mode"),
+                        "target_path": remaining_action.get("target_path"),
+                        "anchor": remaining_action.get("anchor"),
+                        "pattern": remaining_action.get("pattern"),
+                        "command": remaining_action.get("command"),
+                        "pointers": remaining_action.get("pointers"),
+                        "replacement_preview": str(remaining_action.get("replacement") or "")[:120],
+                        "depends_on": list(remaining_action.get("depends_on", []) or []),
+                        "inputs_from": list(remaining_action.get("inputs_from", []) or []),
+                        "timeout_seconds": remaining_action.get("timeout_seconds"),
+                        "max_retries": remaining_action.get("max_retries"),
+                        "status": "skipped",
+                        "changed_files": [],
+                        "no_op": True,
+                    }
+                )
             break
 
     had_material_edit = any(
@@ -321,6 +364,7 @@ def _run_action_plan(
     latest_result["instruction_steps"] = steps
     latest_result["action_steps"] = action_steps
     latest_result["action_plan"] = action_plan
+    latest_result["tasks"] = _merge_runtime_tasks(latest_result.get("tasks"), actions, action_steps)
     return latest_result
 
 
@@ -339,23 +383,126 @@ def _invoke_step_with_timeout(
         step_index=step_index,
         step_count=step_count,
     )
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+    cancel_check = step_state.get("cancel_check")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
         future = executor.submit(app.invoke, step_state, config=config)
-        try:
-            return future.result(timeout=max(timeout_seconds, 1))
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            return {
-                **step_state,
-                "status": "failed",
-                "error": f"Step timed out after {timeout_seconds} seconds.",
-                "human_gate": {
-                    "status": "blocked",
-                    "reason": f"Step timed out after {timeout_seconds} seconds.",
-                    "action": "inspect_runtime_failure",
-                    "prompt": "Review the timed out step, then retry.",
+        deadline = time.monotonic() + max(timeout_seconds, 1)
+        while True:
+            if callable(cancel_check) and cancel_check():
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return {
+                    **step_state,
+                    "status": "cancelled",
+                    "error": "Run cancelled.",
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                return {
+                    **step_state,
+                    "status": "failed",
+                    "error": f"Step timed out after {timeout_seconds} seconds.",
+                    "human_gate": {
+                        "status": "blocked",
+                        "reason": f"Step timed out after {timeout_seconds} seconds.",
+                        "action": "inspect_runtime_failure",
+                        "prompt": "Review the timed out step, then retry.",
+                    },
+                }
+            try:
+                return future.result(timeout=min(0.25, max(remaining, 0.01)))
+            except concurrent.futures.TimeoutError:
+                continue
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _plan_actions_with_cancellation(state: ShipyardState) -> dict[str, Any]:
+    cancel_check = state.get("cancel_check")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(plan_actions, state)
+        while True:
+            if callable(cancel_check) and cancel_check():
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise PlanningCancelledError("Run cancelled during planning.")
+            try:
+                return future.result(timeout=0.25)
+            except concurrent.futures.TimeoutError:
+                continue
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _merge_runtime_tasks(
+    existing_tasks: Any,
+    actions: list[dict[str, Any]],
+    action_steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = [
+        dict(task)
+        for task in list(existing_tasks or [])
+        if isinstance(task, dict)
+    ]
+    seen = {str(task.get("task_id")) for task in tasks if task.get("task_id")}
+    step_by_id = {
+        str(step.get("id")): step
+        for step in action_steps
+        if isinstance(step, dict) and step.get("id")
+    }
+    for index, action in enumerate(actions, start=1):
+        if not isinstance(action, dict):
+            continue
+        task_id = str(action.get("id") or f"step-{index}")
+        if task_id in seen:
+            continue
+        step = step_by_id.get(task_id, {})
+        tasks.append(
+            {
+                "task_id": task_id,
+                "role": action.get("role") or _infer_subagent_role(action),
+                "agent_type": action.get("agent_type") or _infer_subagent_type(action),
+                "parent_task_id": action.get("parent_task_id"),
+                "child_task_ids": list(action.get("child_task_ids", []) or []),
+                "goal": action.get("instruction"),
+                "allowed_actions": list(action.get("allowed_actions", [])) or ([action.get("edit_mode")] if action.get("edit_mode") else []),
+                "status": step.get("status") or ("planned" if action.get("valid", True) else "invalid"),
+                "result": {
+                    "changed_files": list(step.get("changed_files", []) or []),
+                    "no_op": bool(step.get("no_op")),
                 },
+                "artifacts": {
+                    "target_path": step.get("target_path") or action.get("target_path"),
+                    "command": step.get("command") or action.get("command"),
+                },
+                "depends_on": list(action.get("depends_on", []) or []),
+                "inputs_from": list(action.get("inputs_from", []) or []),
             }
+        )
+        seen.add(task_id)
+    return tasks
+
+
+def _infer_subagent_role(action: dict[str, Any]) -> str:
+    action_class = str(action.get("action_class") or "").strip()
+    if action_class == "inspect":
+        return "inspector-agent"
+    if action_class == "verify":
+        return "verifier-agent"
+    return "editor-agent"
+
+
+def _infer_subagent_type(action: dict[str, Any]) -> str:
+    action_class = str(action.get("action_class") or "").strip()
+    if action_class == "inspect":
+        return "inspector"
+    if action_class == "verify":
+        return "verifier"
+    return "editor"
 
 
 def _ensure_session_id(value: Any) -> str:

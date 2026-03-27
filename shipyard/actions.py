@@ -72,6 +72,11 @@ ACTION_CLASSES = {
 class Action(TypedDict, total=False):
     id: str
     instruction: str
+    role: str
+    agent_type: str
+    parent_task_id: str | None
+    child_task_ids: list[str]
+    allowed_actions: list[str]
     target_path: str | None
     target_path_source: str | None
     edit_mode: str
@@ -137,6 +142,13 @@ def normalize_action(
     normalized: Action = {
         "id": action_id,
         "instruction": instruction,
+        "role": str(raw_action.get("role") or fallback.get("role") or "lead-agent"),
+        "agent_type": str(raw_action.get("agent_type") or fallback.get("agent_type") or "primary"),
+        "parent_task_id": raw_action.get("parent_task_id", fallback.get("parent_task_id")),
+        "child_task_ids": list(raw_action.get("child_task_ids", fallback.get("child_task_ids", [])) or []),
+        "allowed_actions": list(
+            raw_action.get("allowed_actions", fallback.get("allowed_actions", [edit_mode])) or [edit_mode]
+        ),
         "target_path": raw_action.get("target_path") or fallback.get("target_path"),
         "target_path_source": raw_action.get("target_path_source") or fallback.get("target_path_source"),
         "edit_mode": edit_mode,
@@ -185,6 +197,11 @@ def build_action_fallback(state: ShipyardState, preferred_mode: str | None = Non
     fallback: dict[str, Any] = {
         "id": state.get("task_id"),
         "instruction": instruction,
+        "role": state.get("role") or "lead-agent",
+        "agent_type": state.get("agent_type") or "primary",
+        "parent_task_id": state.get("parent_task_id"),
+        "child_task_ids": state.get("child_task_ids", []),
+        "allowed_actions": [edit_mode] if edit_mode else [],
         "target_path": target_path,
         "target_path_source": target_path_source,
         "edit_mode": edit_mode,

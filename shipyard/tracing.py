@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -41,7 +42,7 @@ def write_troubleshooting_log(state: ShipyardState) -> str:
 
 
 def _should_update_global_latest(session_id: str) -> bool:
-    return session_id.startswith("web-") or session_id in {"default", "unknown"}
+    return bool(re.fullmatch(r"web-[a-z0-9]+-[a-z0-9]+", session_id))
 
 
 def _build_troubleshooting_payload(state: ShipyardState) -> dict[str, object]:

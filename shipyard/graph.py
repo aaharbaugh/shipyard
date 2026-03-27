@@ -6,6 +6,7 @@ import re
 import shlex
 import subprocess
 import shutil
+import time
 
 from .human_gate import make_human_gate
 from .helper_agent import run_helper_agent
@@ -66,6 +67,55 @@ def _repair_anchor_with_pointers(state: ShipyardState, error: str) -> dict | Non
     }
 
 
+def _replan_mutate_step_from_current_file(state: ShipyardState, error: str) -> dict | None:
+    target_path = state.get("target_path")
+    if not target_path:
+        return None
+    target = Path(str(target_path))
+    if not target.exists() or not target.is_file():
+        return None
+
+    try:
+        current_file_before = read_file(str(target))
+    except OSError:
+        return None
+
+    context = dict(state.get("context", {}) or {})
+    helper_notes = context.get("helper_notes", "")
+    repair_note = (
+        "Replan only this failed mutate step from the exact current file contents. "
+        "Use a localized edit. Do not trust stale anchors from earlier planning. "
+        "Prefer exact pointers when needed."
+    )
+    context["helper_notes"] = f"{helper_notes}\n{repair_note}\nPrevious error: {error}".strip()
+    repaired = propose_edit(
+        {
+            **state,
+            "context": context,
+            "file_before": current_file_before,
+        }
+    )
+    if not repaired.get("is_valid"):
+        return None
+    if repaired.get("edit_mode") not in {"anchor", "rename_symbol"}:
+        return None
+    return {
+        "edit_mode": repaired.get("edit_mode"),
+        "anchor": repaired.get("anchor"),
+        "replacement": repaired.get("replacement"),
+        "pointers": repaired.get("pointers"),
+        "proposal_summary": {
+            **dict(state.get("proposal_summary", {}) or {}),
+            "edit_mode": repaired.get("edit_mode"),
+            "anchor": repaired.get("anchor"),
+            "pointers": repaired.get("pointers"),
+            "repair_reason": "Replanned failed mutate step from the current file contents.",
+        },
+        "context": context,
+        "file_before": current_file_before,
+    }
+
+
 def seed_defaults(state: ShipyardState) -> dict:
     return {
         "edit_attempts": state.get("edit_attempts", 0),
@@ -85,8 +135,25 @@ def consult_helper_agent(state: ShipyardState) -> dict:
     helper_result = run_helper_agent(state)
     context = dict(state.get("context", {}))
     context["helper_notes"] = helper_result["notes"]
+    existing_tasks = list(state.get("tasks", []) or [])
+    helper_task_id = str(helper_result.get("task_id") or "helper-planner-task")
+    helper_task = {
+        "task_id": helper_task_id,
+        "role": helper_result.get("agent_name", "helper-planner"),
+        "agent_type": helper_result.get("agent_type", "helper"),
+        "parent_task_id": state.get("task_id") or "run-root",
+        "goal": helper_result.get("recommendation") or helper_result.get("notes"),
+        "allowed_actions": list(helper_result.get("allowed_actions", [])),
+        "status": "planned",
+        "artifacts": {
+            "task_type": helper_result.get("task_type"),
+            "delegation_mode": helper_result.get("delegation_mode"),
+            "notes": helper_result.get("notes"),
+        },
+    }
     return {
         "context": context,
+        "tasks": [*existing_tasks, helper_task],
         "helper_output": {
             "helper_agent": helper_result,
         },
@@ -206,9 +273,24 @@ def _should_refine_preplanned_action(state: ShipyardState, preplanned: dict) -> 
 
 
 def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
+    target_path = preplanned.get("target_path") or state.get("target_path")
+    current_file_before = state.get("file_before")
+    if target_path:
+        target = Path(str(target_path))
+        if target.exists() and target.is_file():
+            try:
+                current_file_before = read_file(str(target))
+            except OSError:
+                pass
+    context = dict(state.get("context", {}) or {})
+    context["helper_notes"] = (
+        f"{context.get('helper_notes', '')}\n"
+        "Regenerate this step from the exact current target file contents. "
+        "Do not trust stale anchors from earlier planning if the file has been inspected or changed."
+    ).strip()
     seeded_state = {
         **state,
-        "target_path": preplanned.get("target_path") or state.get("target_path"),
+        "target_path": target_path,
         "edit_mode": preplanned.get("edit_mode") or state.get("edit_mode"),
         "anchor": preplanned.get("anchor"),
         "replacement": preplanned.get("replacement"),
@@ -219,6 +301,8 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
         "copy_count": preplanned.get("copy_count"),
         "files": preplanned.get("files"),
         "occurrence_selector": preplanned.get("occurrence_selector"),
+        "file_before": current_file_before,
+        "context": context,
     }
     planned = propose_edit(seeded_state)
     planned.setdefault("target_path", preplanned.get("target_path"))
@@ -401,11 +485,25 @@ def apply_edit(state: ShipyardState) -> dict:
 
     if state.get("edit_mode") == "read_file":
         target_path = state.get("target_path")
-        if not target_path or not Path(target_path).is_file():
+        if not target_path:
             return {
                 "edit_applied": False,
                 "status": "edit_blocked",
                 "error": "Target file was not found for read_file.",
+            }
+        target = Path(target_path)
+        if target.exists() and not target.is_file():
+            return {
+                "edit_applied": False,
+                "status": "edit_blocked",
+                "error": "Target file was not found for read_file.",
+            }
+        if not target.exists():
+            return {
+                "edit_applied": False,
+                "status": "observed",
+                "tool_output": {"tool": "read_file", "target_path": target_path, "missing": True, "content": ""},
+                "no_op": True,
             }
         content = read_file(target_path)
         return {
@@ -501,28 +599,78 @@ def apply_edit(state: ShipyardState) -> dict:
                 "error": "Unsafe shell syntax is not allowed in run_command.",
             }
         cwd = get_session_workspace(state.get("session_id"))
-        completed = subprocess.run(
+        process = subprocess.Popen(
             shlex.split(command),
             cwd=str(cwd),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            check=False,
-            timeout=int(state.get("timeout_seconds") or 20),
         )
+        cancel_check = state.get("cancel_check")
+        deadline = time.monotonic() + int(state.get("timeout_seconds") or 20)
+        stdout = ""
+        stderr = ""
+        returncode = None
+        while True:
+            if callable(cancel_check) and cancel_check():
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                return {
+                    "edit_applied": False,
+                    "status": "cancelled",
+                    "tool_output": {
+                        "tool": state.get("edit_mode"),
+                        "command": command,
+                        "cwd": str(cwd),
+                        "stdout": stdout[:4000],
+                        "stderr": stderr[:4000],
+                    },
+                    "no_op": True,
+                    "error": "Run cancelled.",
+                }
+            if time.monotonic() >= deadline:
+                process.terminate()
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                return {
+                    "edit_applied": False,
+                    "status": "verification_failed" if state.get("edit_mode") in {"verify_command", "run_tests"} else "failed",
+                    "tool_output": {
+                        "tool": state.get("edit_mode"),
+                        "command": command,
+                        "cwd": str(cwd),
+                        "stdout": stdout[:4000],
+                        "stderr": stderr[:4000],
+                    },
+                    "no_op": True,
+                    "error": f"Command timed out after {int(state.get('timeout_seconds') or 20)} seconds.",
+                }
+            returncode = process.poll()
+            if returncode is not None:
+                stdout, stderr = process.communicate()
+                break
+            time.sleep(0.1)
         is_verification = state.get("edit_mode") in {"verify_command", "run_tests"}
         return {
             "edit_applied": False,
-            "status": ("verified" if completed.returncode == 0 else "verification_failed") if is_verification else ("observed" if completed.returncode == 0 else "verification_failed"),
+            "status": ("verified" if returncode == 0 else "verification_failed") if is_verification else ("observed" if returncode == 0 else "verification_failed"),
             "tool_output": {
                 "tool": state.get("edit_mode"),
                 "command": command,
                 "cwd": str(cwd),
-                "returncode": completed.returncode,
-                "stdout": completed.stdout[:4000],
-                "stderr": completed.stderr[:4000],
+                "returncode": returncode,
+                "stdout": stdout[:4000],
+                "stderr": stderr[:4000],
             },
             "no_op": True,
-            "error": None if completed.returncode == 0 else f"Command failed with exit code {completed.returncode}.",
+            "error": None if returncode == 0 else f"Command failed with exit code {returncode}.",
         }
 
     if state.get("edit_mode") == "create_directory":
@@ -1005,6 +1153,76 @@ def apply_edit(state: ShipyardState) -> dict:
                             },
                             "context": repaired.get("context"),
                         }
+        replanned = _replan_mutate_step_from_current_file(state, str(exc))
+        if replanned:
+            repaired_state = {
+                **state,
+                **replanned,
+            }
+            repaired_mode = repaired_state.get("edit_mode")
+            repaired_anchor = repaired_state.get("anchor")
+            repaired_replacement = repaired_state.get("replacement")
+            repaired_pointers = repaired_state.get("pointers")
+            repaired_file_before = repaired_state.get("file_before", file_before)
+            try:
+                if repaired_mode == "rename_symbol" and repaired_anchor and repaired_replacement is not None:
+                    snapshot_path = snapshot_file(target_path)
+                    apply_symbol_rename(target_path, repaired_anchor, repaired_replacement)
+                    updated = read_file(target_path)
+                    changed = updated != repaired_file_before
+                    return {
+                        "edit_applied": changed,
+                        "edit_attempts": edit_attempts,
+                        "snapshot_path": snapshot_path,
+                        "changed_files": [str(Path(target_path).resolve())] if changed else [],
+                        "no_op": not changed,
+                        "status": "edited",
+                        "proposal_summary": replanned.get("proposal_summary"),
+                        "context": replanned.get("context"),
+                    }
+                if repaired_pointers:
+                    validate_pointer_edits(repaired_file_before, repaired_pointers, repaired_anchor)
+                    snapshot_path = snapshot_file(target_path)
+                    updated = apply_pointer_edits(
+                        target_path,
+                        repaired_pointers,
+                        repaired_replacement,
+                        repaired_anchor,
+                    )
+                    changed = updated != repaired_file_before
+                    return {
+                        "edit_applied": changed,
+                        "edit_attempts": edit_attempts,
+                        "snapshot_path": snapshot_path,
+                        "changed_files": [str(Path(target_path).resolve())] if changed else [],
+                        "no_op": not changed,
+                        "status": "edited",
+                        "pointers": repaired_pointers,
+                        "proposal_summary": replanned.get("proposal_summary"),
+                        "context": replanned.get("context"),
+                    }
+                if repaired_anchor and repaired_replacement is not None:
+                    validate_anchor_edit(repaired_file_before, repaired_anchor, repaired_state.get("occurrence_selector"))
+                    snapshot_path = snapshot_file(target_path)
+                    updated = apply_anchor_edit(
+                        target_path,
+                        repaired_anchor,
+                        repaired_replacement,
+                        repaired_state.get("occurrence_selector"),
+                    )
+                    changed = updated != repaired_file_before
+                    return {
+                        "edit_applied": changed,
+                        "edit_attempts": edit_attempts,
+                        "snapshot_path": snapshot_path,
+                        "changed_files": [str(Path(target_path).resolve())] if changed else [],
+                        "no_op": not changed,
+                        "status": "edited",
+                        "proposal_summary": replanned.get("proposal_summary"),
+                        "context": replanned.get("context"),
+                    }
+            except AnchorEditError:
+                pass
         return {
             "edit_applied": False,
             "edit_attempts": edit_attempts,

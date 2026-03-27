@@ -19,6 +19,10 @@ from .planning_hints import is_stale_scratch_target
 from .tools.edit_file import find_anchor_pointers
 
 
+class PlanningCancelledError(RuntimeError):
+    pass
+
+
 def plan_actions(state: ShipyardState) -> dict[str, Any]:
     state = _sanitize_state_for_scaffold_planning(state)
     explicit_mode = (state.get("proposal_mode") or "").strip().lower()
@@ -72,6 +76,7 @@ def _openai_action_plan_or_fallback(state: ShipyardState) -> dict[str, Any]:
             api_key=api_key,
             payload=_openai_action_plan_request(model, _build_action_plan_prompt(state)),
             timeout=20.0,
+            cancel_check=state.get("cancel_check"),
         )
     except Exception as exc:
         actions = [
@@ -294,6 +299,7 @@ def _repair_action_plan(
                 _build_action_plan_repair_prompt(state, validation_errors),
             ),
             timeout=20.0,
+            cancel_check=state.get("cancel_check"),
         )
     except Exception:
         return None
@@ -402,6 +408,7 @@ def _plan_explicit_scaffold_files(
                 schema=_scaffold_files_schema(),
             ),
             timeout=30.0,
+            cancel_check=state.get("cancel_check"),
         )
     except Exception:
         return None
@@ -544,9 +551,17 @@ def _openai_headers(api_key: str) -> dict[str, str]:
     }
 
 
-def _post_openai_with_retry(*, api_key: str, payload: dict[str, Any], timeout: float) -> httpx.Response:
+def _post_openai_with_retry(
+    *,
+    api_key: str,
+    payload: dict[str, Any],
+    timeout: float,
+    cancel_check: Any = None,
+) -> httpx.Response:
     last_exc: Exception | None = None
     for attempt in range(3):
+        if callable(cancel_check) and cancel_check():
+            raise PlanningCancelledError("Run cancelled during planning.")
         try:
             with httpx.Client(timeout=timeout) as client:
                 response = client.post(
@@ -565,7 +580,11 @@ def _post_openai_with_retry(*, api_key: str, payload: dict[str, Any], timeout: f
             last_exc = exc
             if attempt == 2:
                 raise
-        time.sleep(0.5 * (attempt + 1))
+        sleep_deadline = time.monotonic() + (0.5 * (attempt + 1))
+        while time.monotonic() < sleep_deadline:
+            if callable(cancel_check) and cancel_check():
+                raise PlanningCancelledError("Run cancelled during planning.")
+            time.sleep(0.1)
     if last_exc:
         raise last_exc
     raise RuntimeError("OpenAI request failed without a response.")
@@ -603,8 +622,11 @@ def _build_action_plan_prompt(state: ShipyardState) -> str:
         "Return only JSON.",
         "Plan the user request as an ordered list of actions.",
         "Use the key actions with an array of objects.",
-        "Each action should include: id, instruction, action_class, edit_mode, target_path, anchor, replacement, quantity, copy_count, files, pattern, command, pointers, source_path, destination_path, paths, depends_on, inputs_from, timeout_seconds, max_retries, full_file_rewrite.",
+        "Each action should include: id, instruction, role, agent_type, parent_task_id, child_task_ids, allowed_actions, action_class, edit_mode, target_path, anchor, replacement, quantity, copy_count, files, pattern, command, pointers, source_path, destination_path, paths, depends_on, inputs_from, timeout_seconds, max_retries, full_file_rewrite.",
         "Allowed action_class values: inspect, mutate, verify.",
+        "Use bounded roles like orchestrator, inspector-agent, editor-agent, verifier-agent, helper-anchor-planner, helper-function-planner, or helper-verifier when appropriate.",
+        "Use agent_type values like supervisor, inspector, editor, verifier, helper, or function-editor.",
+        "Keep child tasks bounded: each task should have a small allowed_actions list and a clear parent_task_id when it belongs to a larger workflow.",
         "Allowed edit_mode values: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, scaffold_files, rename_symbol, list_files, read_file, read_many_files, search_files, run_command, verify_command, create_directory, move_file, rename_file, search_and_replace, run_tests, inspect_imports.",
         "Use id for stable step references. depends_on and inputs_from should reference earlier ids when a later step relies on them.",
         "Do not omit separate steps just because they appear in one sentence.",

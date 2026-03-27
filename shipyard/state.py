@@ -42,6 +42,9 @@ class StepSection(TypedDict, total=False):
 class TaskSection(TypedDict, total=False):
     task_id: str
     role: str
+    agent_type: str
+    parent_task_id: str
+    child_task_ids: list[str]
     goal: str
     allowed_actions: list[str]
     status: str

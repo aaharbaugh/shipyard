@@ -82,6 +82,7 @@ class RunQueue:
             "current_task": "Waiting",
             "queue_state": "queued",
             "task_events": [],
+            "tasks": [_build_root_task(job_id, state)],
             "agents": _infer_agents(state),
             "routing": route_message(
                 state.get("instruction", ""),
@@ -120,6 +121,7 @@ class RunQueue:
             "current_task": "Completed",
             "queue_state": "completed" if result.get("status") not in {"failed", "invalid_proposal", "edit_blocked", "blocked"} else "failed",
             "task_events": list(result.get("task_events", [])),
+            "tasks": _merge_tasks([_build_root_task(job_id, state)], result.get("tasks", [])),
             "agents": _infer_agents(state),
             "routing": route_message(
                 state.get("instruction", ""),
@@ -197,6 +199,7 @@ class RunQueue:
                 job["state"]["cancel_check"] = lambda job_id=job_id: self._is_cancel_requested(job_id)
                 result = self._runner(job["state"], lambda event, payload: self._record_progress(job_id, event, payload))
                 job["result"] = result
+                job["tasks"] = _merge_tasks(job.get("tasks", []), result.get("tasks", []))
                 job["status"] = RESULT_TO_QUEUE_STATUS.get(result.get("status"), "completed")
                 job["queue_state"] = job["status"]
                 job["result_status"] = result.get("status")
@@ -235,6 +238,7 @@ class RunQueue:
             if next_status:
                 job["status"] = next_status
                 job["queue_state"] = next_status
+            job["tasks"] = _update_job_tasks(job.get("tasks", []), job, event, payload)
             task_events = list(job.get("task_events", []))
             task_events.append(
                 {
@@ -264,3 +268,80 @@ def _infer_agents(state: ShipyardState) -> list[str]:
 
 def _public_job(job: dict[str, Any] | None) -> dict[str, Any] | None:
     return build_public_job(job)
+
+
+def _build_root_task(job_id: str, state: ShipyardState) -> dict[str, Any]:
+    return {
+        "task_id": f"run-{job_id}",
+        "role": "orchestrator",
+        "agent_type": "supervisor",
+        "goal": state.get("instruction"),
+        "allowed_actions": ["plan_actions", "delegate_tasks", "cancel_run"],
+        "status": "queued",
+        "child_task_ids": [],
+        "artifacts": {
+            "session_id": state.get("session_id"),
+        },
+    }
+
+
+def _merge_tasks(existing: list[dict[str, Any]], incoming: Any) -> list[dict[str, Any]]:
+    merged = [dict(task) for task in existing if isinstance(task, dict)]
+    index_by_id = {
+        str(task.get("task_id")): idx
+        for idx, task in enumerate(merged)
+        if task.get("task_id")
+    }
+    for task in list(incoming or []):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            continue
+        if task_id in index_by_id:
+            merged[index_by_id[task_id]] = {**merged[index_by_id[task_id]], **task}
+        else:
+            index_by_id[task_id] = len(merged)
+            merged.append(dict(task))
+    return merged
+
+
+def _update_job_tasks(
+    existing: list[dict[str, Any]],
+    job: dict[str, Any],
+    event: str,
+    payload: dict[str, Any],
+) -> list[dict[str, Any]]:
+    tasks = _merge_tasks([], existing)
+    root_id = f"run-{job['job_id']}"
+    root_index = next((index for index, task in enumerate(tasks) if task.get("task_id") == root_id), None)
+    if root_index is not None:
+        tasks[root_index]["status"] = EVENT_TO_STATUS.get(event, tasks[root_index].get("status", "queued"))
+
+    if event not in {"lead_agent", "verifying", "step_retry"}:
+        return tasks
+
+    step_id = str(payload.get("step_id") or f"step-{payload.get('step_index') or len(tasks)}")
+    step_task = {
+        "task_id": step_id,
+        "role": payload.get("role") or "lead-agent",
+        "agent_type": payload.get("agent_type") or "primary",
+        "parent_task_id": root_id,
+        "goal": payload.get("instruction"),
+        "allowed_actions": list(payload.get("allowed_actions", []) or []),
+        "status": EVENT_TO_STATUS.get(event, "running"),
+        "artifacts": {
+            "step_index": payload.get("step_index"),
+            "step_count": payload.get("step_count"),
+            "depends_on": list(payload.get("depends_on", []) or []),
+            "inputs_from": list(payload.get("inputs_from", []) or []),
+        },
+    }
+    tasks = _merge_tasks(tasks, [step_task])
+    root = next((task for task in tasks if task.get("task_id") == root_id), None)
+    if root is not None:
+        children = list(root.get("child_task_ids", []) or [])
+        if step_id not in children:
+            children.append(step_id)
+            root["child_task_ids"] = children
+    return tasks

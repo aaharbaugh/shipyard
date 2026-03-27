@@ -26,8 +26,9 @@ class GraphFlowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "verified")
             self.assertEqual(path.read_text(encoding="utf-8"), 'print("new")\n')
-            self.assertEqual(result["helper_output"]["helper_agent"]["agent_name"], "helper-planner")
+            self.assertEqual(result["helper_output"]["helper_agent"]["agent_name"], "helper-anchor-planner")
             self.assertEqual(result["helper_output"]["helper_agent"]["delegation_mode"], "sequential")
+            self.assertEqual(result["tasks"][0]["role"], "helper-anchor-planner")
             self.assertEqual(result["helper_output"]["proposal"]["provider"], "heuristic")
             self.assertTrue(result["proposal_summary"]["is_valid"])
             self.assertEqual(result["proposal_summary"]["edit_mode"], "anchor")
@@ -53,6 +54,38 @@ class GraphFlowTests(unittest.TestCase):
             self.assertEqual(result["status"], "edit_blocked")
             self.assertEqual(path.read_text(encoding="utf-8"), original)
             self.assertIn("Anchor was not found", result["error"])
+
+    def test_apply_edit_replans_stale_anchor_from_current_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "formatter.py"
+            path.write_text('def format_result(value, unit):\n    return f"Average latency: {value} {unit}"\n', encoding="utf-8")
+
+            with patch(
+                "shipyard.graph.propose_edit",
+                return_value={
+                    "edit_mode": "anchor",
+                    "anchor": 'Average latency',
+                    "replacement": 'Processed latency',
+                    "is_valid": True,
+                    "validation_errors": [],
+                    "pointers": None,
+                    "occurrence_selector": None,
+                },
+            ):
+                result = apply_edit(
+                    {
+                        "instruction": 'Change "Processed" to "Average latency"',
+                        "target_path": str(path),
+                        "edit_mode": "anchor",
+                        "anchor": 'Processed latency',
+                        "replacement": 'Average latency',
+                        "file_before": path.read_text(encoding="utf-8"),
+                        "context": {"helper_notes": "Use the exact current file"},
+                    }
+                )
+
+            self.assertEqual(result["status"], "edited")
+            self.assertIn("repair_reason", result["proposal_summary"])
 
     def test_graph_stops_early_on_invalid_proposal(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,6 +197,7 @@ class GraphFlowTests(unittest.TestCase):
             self.assertTrue(result["code_graph_status"]["index_state"]["stale"])
             self.assertTrue(result["code_graph_status"]["context_collected"])
             self.assertEqual(result["code_graph_status"]["query_mode"], "function_source_only")
+            self.assertEqual(result["helper_output"]["helper_agent"]["agent_name"], "helper-function-planner")
             self.assertEqual(result["helper_output"]["helper_agent"]["task_type"], "function_edit_planning")
             self.assertEqual(result["helper_output"]["edit_context"]["mode"], "named_function")
             self.assertEqual(result["helper_output"]["edit_context"]["function_name"], "boot_system")
@@ -553,6 +587,28 @@ class GraphFlowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "edit_blocked")
             self.assertIn("Target file was not found for read_file.", result["error"])
+
+    def test_graph_read_file_missing_target_is_non_blocking_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = Path(tmpdir) / "reporter.py"
+
+            result = build_graph().invoke(
+                {
+                    "instruction": "Read reporter.py before creating it",
+                    "edit_mode": "read_file",
+                    "target_path": str(missing),
+                    "preplanned_action": {
+                        "instruction": "Read reporter.py before creating it",
+                        "edit_mode": "read_file",
+                        "target_path": str(missing),
+                        "valid": True,
+                        "validation_errors": [],
+                    },
+                }
+            )
+
+            self.assertEqual(result["status"], "observed")
+            self.assertTrue(result["tool_output"]["missing"])
 
     def test_graph_supports_copy_file_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
