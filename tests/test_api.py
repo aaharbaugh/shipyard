@@ -63,7 +63,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn("queue_timeline", response.body.decode("utf-8"))
         self.assertIn("Queue Events", response.body.decode("utf-8"))
         self.assertIn("Use Managed Workspace", response.body.decode("utf-8"))
-        self.assertIn("Use Selected Folder", response.body.decode("utf-8"))
+        self.assertIn("Use This Folder", response.body.decode("utf-8"))
         self.assertIn("Rebuild Graph", response.body.decode("utf-8"))
 
     def test_instruct_persists_session_result(self) -> None:

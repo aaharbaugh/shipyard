@@ -1045,12 +1045,13 @@ WORKBENCH_HTML = """<!doctype html>
         </div>
         <details>
           <summary>Settings &amp; Workspace</summary>
-          <p class="muted" id="workspace_details" style="font-size:0.84rem; margin: 8px 0 4px;">Attach this session to the managed workspace or a folder from the current repo.</p>
-          <label for="workspace_select">Repo Folder</label>
-          <select id="workspace_select"></select>
+          <p class="muted" id="workspace_details" style="font-size:0.84rem; margin: 8px 0 4px;">Attach this session to any folder — type a path or pick from the list.</p>
+          <label for="workspace_select">Workspace Path</label>
+          <input id="workspace_select" placeholder="/home/aaron/projects/gauntlet/ship/ship-rebuild" list="workspace_options" />
+          <datalist id="workspace_options"></datalist>
           <div class="actions" style="margin-top:8px;">
-            <button class="secondary" id="workspace_select_button">Use Selected Folder</button>
-            <button class="secondary" id="workspace_refresh_button">Refresh</button>
+            <button class="secondary" id="workspace_select_button">Use This Folder</button>
+            <button class="secondary" id="workspace_refresh_button">Refresh List</button>
           </div>
           <div class="row" style="margin-top:12px;">
             <div>
@@ -2240,14 +2241,17 @@ WORKBENCH_HTML = """<!doctype html>
     }
 
     function renderWorkspaceFolders(items, selectedPath) {
-      const selectEl = document.getElementById("workspace_select");
-      const options = [{path: "", label: "Managed workspace (.shipyard/data/workspace/default)"}].concat(Array.isArray(items) ? items : []);
-      selectEl.innerHTML = options.map((item) => {
-        const value = escapeHtml(item.path || "");
+      const inputEl = document.getElementById("workspace_select");
+      const datalistEl = document.getElementById("workspace_options");
+      const options = [{path: "", label: "Managed workspace (default)"}].concat(Array.isArray(items) ? items : []);
+      datalistEl.innerHTML = options.map((item) => {
+        const value = escapeHtml(item.resolved_path || item.path || "");
         const label = escapeHtml(item.label || item.path || "");
-        const selected = (item.path || "") === (selectedPath || "") ? " selected" : "";
-        return `<option value="${value}"${selected}>${label}</option>`;
+        return `<option value="${value}">${label}</option>`;
       }).join("");
+      if (selectedPath) {
+        inputEl.value = selectedPath;
+      }
     }
 
     function verificationCommands() {

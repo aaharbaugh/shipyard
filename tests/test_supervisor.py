@@ -23,7 +23,7 @@ class SupervisorDetectionTests(unittest.TestCase):
     def test_refactor_keyword_triggers_supervisor(self) -> None:
         self.assertTrue(should_use_supervisor({
             "instruction": "refactor the authentication system to use JWT tokens across all services",
-            "broad_context": {"file_tree": ["api/routes.ts", "web/auth.tsx"], "discovered_docs": ["docs/auth.md"]},
+            "broad_context": {"file_tree": ["api/routes.ts", "api/auth.ts", "web/auth.tsx", "web/app.tsx", "shared/types.ts", "docs/auth.md"], "discovered_docs": ["docs/auth.md"]},
         }))
 
     def test_explicit_multi_agent_request(self) -> None:
@@ -35,13 +35,14 @@ class SupervisorDetectionTests(unittest.TestCase):
         self.assertTrue(should_use_supervisor({
             "instruction": "update the api and web packages to use the new shared types",
             "broad_context": {
-                "file_tree": ["api/src/index.ts", "web/src/App.tsx", "shared/types.ts"],
+                "file_tree": ["api/src/index.ts", "api/src/routes.ts", "web/src/App.tsx", "web/src/main.tsx", "shared/types.ts", "package.json"],
             },
         }))
 
     def test_implement_keyword_triggers_supervisor(self) -> None:
         self.assertTrue(should_use_supervisor({
             "instruction": "implement the new feature described in the spec",
+            "broad_context": {"file_tree": ["src/app.ts", "src/routes.ts", "src/db.ts", "src/types.ts", "docs/spec.md", "package.json"]},
         }))
 
 

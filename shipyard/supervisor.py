@@ -34,6 +34,10 @@ def should_use_supervisor(state: ShipyardState) -> bool:
     broad_context = state.get("broad_context") or {}
     file_tree = broad_context.get("file_tree") or []
 
+    # Explicit multi-agent request always honored
+    if "multi-agent" in instruction or "parallel" in instruction:
+        return True
+
     # Don't decompose on empty/near-empty workspaces — nothing to parallelize
     if len(file_tree) < 5:
         return False
@@ -42,10 +46,6 @@ def should_use_supervisor(state: ShipyardState) -> bool:
     _create_signals = ("scaffold", "create a", "set up a", "initialize", "init a", "bootstrap")
     if any(instruction.startswith(s) or f" {s}" in instruction for s in _create_signals):
         return False
-
-    # Explicit multi-agent request
-    if "multi-agent" in instruction or "parallel" in instruction:
-        return True
 
     # Simple/short instructions → single agent
     if len(instruction) < 40:
