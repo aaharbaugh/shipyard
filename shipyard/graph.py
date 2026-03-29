@@ -1266,13 +1266,11 @@ def apply_edit(state: ShipyardState) -> dict:
             # Use sandbox to resolve relative paths to workspace
             resolved_path = _sandbox_target_path(raw_path, state) or raw_path
             file_path = Path(resolved_path)
-            if file_path.exists():
-                return {
-                    "edit_applied": False,
-                    "edit_attempts": edit_attempts,
-                    "status": "edit_blocked",
-                    "error": f"scaffold_files would overwrite existing file: {file_path.name}",
-                }
+            # Allow overwriting existing files — scaffold is used for both
+            # initial creation and filling in stubs during rebuild.
+            if file_path.exists() and not created_files:
+                # Snapshot the first existing file for rollback
+                snapshot_file(str(file_path))
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(str(file_spec.get("content", "")), encoding="utf-8")
             created_files.append(str(file_path.resolve()))
