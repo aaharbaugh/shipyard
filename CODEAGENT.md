@@ -50,6 +50,41 @@ Heuristics should only be used when:
 - the model is unavailable
 - heuristic mode is explicitly requested
 
+### Determinism Boundary
+
+Shipyard must keep a hard boundary between model intent and runtime enforcement.
+
+Allowed deterministic runtime behavior:
+
+- path/workspace safety
+- required field validation
+- pointer shape validation
+- dependency integrity checks
+- rollback and transaction semantics
+- timeout, cancel, and queue lifecycle behavior
+- narrow field normalization for structurally equivalent payloads
+  - example: `files -> paths` for `read_many_files`
+
+Disallowed deterministic runtime behavior:
+
+- inferring user intent from prompt wording beyond narrow filename/path extraction
+- converting one semantic edit intent into another because it "seems right"
+- inventing replacement code/content locally
+- reclassifying scaffold vs localized edit vs full rewrite based on local guesses
+- silently compensating for weak model output with semantic rewrite logic
+
+Repair policy:
+
+- invalid plan -> ask the model for corrected actions
+- invalid mutate step -> ask the model for a corrected mutate step
+- verify failure -> ask the model for a corrected mutate/verify slice when recovery is needed
+- runtime may reject or route, but should not become a second planner
+
+Rule of thumb:
+
+- if the change requires understanding what the user means, it belongs in the model prompt/schema
+- if the change requires enforcing what is safe or structurally valid, it belongs in the runtime
+
 ### Action Model
 
 The runtime should converge on a stable action set rather than a growing list of

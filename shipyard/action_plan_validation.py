@@ -3,7 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .intent_parser import split_instruction_steps
 from .planning_hints import extract_explicit_filenames
 
 
@@ -20,22 +19,22 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
             + "."
         )
 
-    expected_steps = split_instruction_steps(instruction)
-    if len(expected_steps) > 1 and len(actions) < len(expected_steps):
-        errors.append(
-            f"Instruction implies {len(expected_steps)} steps, but the action plan only returned {len(actions)} action(s)."
-        )
-
     explicit_files = extract_explicit_filenames(instruction)
     action_ids = [str(action.get("id")) for action in actions if action.get("id")]
     if len(action_ids) != len(set(action_ids)):
         errors.append("Action plan contains duplicate step ids.")
     known_ids = set(action_ids)
     for index, action in enumerate(actions, start=1):
-        for dependency in list(action.get("depends_on", []) or []):
+        deps = action.get("depends_on") or []
+        if isinstance(deps, str):
+            deps = [deps]
+        for dependency in deps:
             if dependency not in known_ids:
                 errors.append(f"Action {index} depends on unknown step id `{dependency}`.")
-        for dependency in list(action.get("inputs_from", []) or []):
+        inputs = action.get("inputs_from") or []
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        for dependency in inputs:
             if dependency not in known_ids:
                 errors.append(f"Action {index} references unknown inputs_from step id `{dependency}`.")
     if explicit_files:
@@ -53,3 +52,37 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
             )
 
     return errors
+
+
+def check_inspect_first(actions: list[dict[str, Any]]) -> list[str]:
+    """Check that mutate steps on existing files depend on an inspect step.
+
+    Returns warnings (not hard errors) — plans missing inspection are suboptimal
+    but the runtime's fetch_step_context will still load file contents before editing.
+    """
+    warnings: list[str] = []
+    _INSPECT_MODES = {"read_file", "read_many_files", "search_files", "list_files", "run_command", "inspect_imports"}
+    _MUTATE_MODES = {"write_file", "search_and_replace", "anchor", "named_function", "rename_symbol", "append", "prepend"}
+    inspect_ids: set[str] = set()
+    for action in actions:
+        if action.get("action_class") == "inspect" or str(action.get("edit_mode", "")) in _INSPECT_MODES:
+            aid = str(action.get("id", ""))
+            if aid:
+                inspect_ids.add(aid)
+
+    for index, action in enumerate(actions, start=1):
+        mode = str(action.get("edit_mode", ""))
+        if mode not in _MUTATE_MODES:
+            continue
+        if action.get("expected_existing_state") == "new_file":
+            continue
+        deps = set(action.get("depends_on", []) or []) | set(action.get("inputs_from", []) or [])
+        if deps and deps & inspect_ids:
+            continue
+        target = action.get("target_path", "unknown")
+        warnings.append(
+            f"Action {index} ({mode} on {target}) has no inspect dependency. "
+            "Plans should inspect files (read_file, run_command) before editing them."
+        )
+
+    return warnings

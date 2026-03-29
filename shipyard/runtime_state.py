@@ -23,7 +23,11 @@ def enrich_state_sections(state: ShipyardState) -> ShipyardState:
         "edit_attempts": state.get("edit_attempts"),
         "max_edit_attempts": state.get("max_edit_attempts"),
         "reverted_to_snapshot": state.get("reverted_to_snapshot"),
+        "reverted_files": list(state.get("reverted_files", []) or []),
+        "revert_count": state.get("revert_count"),
         "target_existed_before_edit": state.get("target_existed_before_edit"),
+        "verification_results": list(state.get("verification_results", []) or []),
+        "verification_retry_count": state.get("verification_retry_count"),
     }
     public_state: ShipyardState = {
         "request": _compact_object(
@@ -115,6 +119,7 @@ def _build_steps(state: ShipyardState) -> list[dict[str, Any]]:
                     "status": step.get("status"),
                     "changed_files": step.get("changed_files", []),
                     "no_op": step.get("no_op"),
+                    "retry_count": step.get("retry_count"),
                     "timeout_seconds": step.get("timeout_seconds"),
                     "max_retries": step.get("max_retries"),
                 }
@@ -182,6 +187,7 @@ def _build_tasks(state: ShipyardState) -> list[dict[str, Any]]:
                         "changed_files": step.get("changed_files", []),
                         "no_op": step.get("no_op"),
                     },
+                    "retry_count": step.get("retry_count"),
                     "artifacts": {
                         "target_path": step.get("target_path") or action.get("target_path"),
                         "command": step.get("command") or action.get("command"),

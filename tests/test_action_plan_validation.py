@@ -30,16 +30,6 @@ class ActionPlanValidationTests(unittest.TestCase):
         self.assertTrue(any("math_utils.py" in error for error in errors))
         self.assertTrue(any("config.json" in error for error in errors))
 
-    def test_validate_action_plan_rejects_too_few_steps(self) -> None:
-        errors = validate_action_plan(
-            "create 4 files and then write hello world",
-            [
-                {"target_path": "file1.txt", "valid": True},
-            ],
-        )
-
-        self.assertTrue(any("2 steps" in error for error in errors))
-
     def test_validate_action_plan_accepts_scaffold_files_covering_explicit_names(self) -> None:
         errors = validate_action_plan(
             "Create a tiny repo with main.py and config.json",

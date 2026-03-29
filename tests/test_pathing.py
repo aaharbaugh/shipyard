@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from shipyard.pathing import resolve_target_path
 from shipyard.planning_hints import is_stale_scratch_target
@@ -28,6 +31,38 @@ class PathingTests(unittest.TestCase):
 
         self.assertIn("/.shipyard/data/workspace/default/file1.txt", path)
         self.assertEqual(source, "sandboxed_target_path")
+
+    def test_testing_mode_rebases_relative_target_into_selected_repo_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch("pathlib.Path.cwd", return_value=Path(tmpdir)):
+            folder = Path(tmpdir) / "demo"
+            folder.mkdir()
+
+            path, source = resolve_target_path(
+                "file1.txt",
+                {"testing_mode": True, "workspace_path": "demo"},
+                "write_file",
+                session_id="demo",
+            )
+
+            self.assertEqual(path, str((folder / "file1.txt").resolve()))
+            self.assertEqual(source, "sandboxed_target_path")
+
+    def test_testing_mode_preserves_repo_relative_path_inside_selected_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch("pathlib.Path.cwd", return_value=Path(tmpdir)):
+            folder = Path(tmpdir) / "demo"
+            folder.mkdir()
+            nested = folder / "main.py"
+            nested.write_text("", encoding="utf-8")
+
+            path, source = resolve_target_path(
+                "demo/main.py",
+                {"testing_mode": True, "workspace_path": "demo"},
+                "write_file",
+                session_id="demo",
+            )
+
+            self.assertEqual(path, str(nested.resolve()))
+            self.assertEqual(source, "explicit_target_path")
 
     def test_testing_mode_rebases_absolute_target_outside_data_root(self) -> None:
         path, source = resolve_target_path(

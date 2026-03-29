@@ -29,6 +29,32 @@ architecture is not "add more verbs." The long-term architecture is:
 
 - `LLM planner -> structured actions -> executor -> verification`
 
+## Determinism Boundary
+
+Shipyard is intentionally LLM-first. The runtime should enforce safety and structure,
+not reinterpret user intent.
+
+Runtime code may:
+
+- validate action schema and required fields
+- enforce workspace/path safety
+- validate pointers and dependency graphs
+- manage rollback, retries, cancellation, and queue state
+- normalize structurally equivalent payload shapes
+
+Runtime code should not:
+
+- infer semantic intent from prompt phrasing
+- invent replacement code locally
+- silently convert scaffold/edit/rewrite intent based on local guesses
+- compensate for weak model output with semantic parser logic
+
+The intended repair flow is:
+
+- bad plan -> ask the model for a corrected plan
+- bad mutate step -> ask the model for a corrected mutate step
+- verify failure -> recover safely, then ask the model for a corrected mutate/verify slice if needed
+
 ## Architecture
 
 ### 1. Workbench

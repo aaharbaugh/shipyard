@@ -135,6 +135,15 @@ def index_code_graph(
 ) -> dict[str, Any]:
     executable = _find_cgr_executable()
     root = _normalize_workdir(workdir)
+
+    if err := _validate_repo_path(root, "workdir"):
+        return {"ok": False, "reason": err}
+
+    proto_dir = Path(output_dir).resolve() if output_dir else root / DEFAULT_PROTO_DIR
+    if output_dir:
+        if err := _validate_repo_path(proto_dir, "output_dir"):
+            return {"ok": False, "reason": err}
+
     if executable is None:
         return {
             "ok": False,
@@ -142,7 +151,6 @@ def index_code_graph(
             "index_state": inspect_code_graph_artifacts(str(root)),
         }
 
-    proto_dir = Path(output_dir) if output_dir else root / DEFAULT_PROTO_DIR
     proto_dir.mkdir(parents=True, exist_ok=True)
 
     completed = subprocess.run(
@@ -184,6 +192,10 @@ def sync_live_code_graph(
 ) -> dict[str, Any]:
     executable = _find_cgr_executable()
     root = _normalize_workdir(workdir)
+
+    if err := _validate_repo_path(root, "workdir"):
+        return {"ok": False, "reason": err}
+
     if executable is None:
         return {
             "ok": False,
@@ -237,10 +249,33 @@ def _find_cgr_executable() -> str | None:
 
 
 def _cgr_env() -> dict[str, str]:
-    env = dict(os.environ)
-    env.pop("OPENAI_API_KEY", None)
-    env.pop("OPENAI_MODEL", None)
-    return env
+    """Return a minimal env for cgr subprocesses.
+
+    Uses a whitelist rather than stripping known secrets, so future credentials
+    added to the parent environment are not accidentally inherited.
+    """
+    _PASSTHROUGH = frozenset(
+        {
+            "PATH",
+            "HOME",
+            "USER",
+            "LOGNAME",
+            "SHELL",
+            "TERM",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            # cgr-specific config
+            "CGR_NEO4J_URI",
+            "CGR_NEO4J_USER",
+            "CGR_NEO4J_PASSWORD",
+            "CGR_LOG_LEVEL",
+        }
+    )
+    return {k: v for k, v in os.environ.items() if k in _PASSTHROUGH}
 
 
 def _cgr_run_dir() -> str:
@@ -298,6 +333,16 @@ def _normalize_workdir(workdir: str | None) -> Path:
     if candidate.is_file():
         return candidate.parent
     return candidate
+
+
+def _validate_repo_path(path: Path, label: str) -> str | None:
+    """Return an error string if *path* escapes the process working directory, else None."""
+    repo_root = Path.cwd().resolve()
+    try:
+        path.relative_to(repo_root)
+        return None
+    except ValueError:
+        return f"{label} must be within the repository root ({repo_root}): got {path}"
 
 
 def _latest_source_mtime(root: Path) -> float | None:

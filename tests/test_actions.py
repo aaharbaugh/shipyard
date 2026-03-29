@@ -142,6 +142,21 @@ class ActionNormalizationTests(unittest.TestCase):
         self.assertEqual(action["edit_mode"], "rename_file")
         self.assertTrue(action["valid"])
 
+    def test_normalize_action_maps_read_many_files_files_to_paths(self) -> None:
+        action = normalize_action(
+            {
+                "instruction": "Read the main UI files",
+                "edit_mode": "read_many_files",
+                "files": ["index.html", "app.js", "styles.css"],
+            },
+            fallback={},
+            provider="openai",
+            provider_reason="planned",
+        )
+
+        self.assertEqual(action["paths"], ["index.html", "app.js", "styles.css"])
+        self.assertTrue(action["valid"])
+
 
 if __name__ == "__main__":
     unittest.main()

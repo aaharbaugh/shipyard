@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from .planning_hints import extract_explicit_filenames
 from .repo_context import build_repo_context_lines
 from .state import RuntimeContext, ShipyardState
@@ -28,7 +30,7 @@ def build_runtime_prompt(state: ShipyardState) -> str:
     tool_outputs = list(state.get("tool_outputs", []) or [])
     if tool_outputs:
         sections.append("Previous tool outputs:")
-        for output in tool_outputs[-4:]:
+        for output in tool_outputs[-2:]:
             sections.append(f"- {output}")
 
     edit_mode = state.get("edit_mode")
@@ -56,12 +58,12 @@ def build_runtime_prompt(state: ShipyardState) -> str:
 def build_proposal_prompt(state: ShipyardState) -> str:
     context = state.get("context", {})
     helper_output = state.get("helper_output", {})
-    code_graph_status = state.get("code_graph_status", {})
     explicit_files = extract_explicit_filenames(state.get("instruction", ""))
     lines = [
-        "Return only JSON with keys: target_path, anchor, replacement, edit_mode, copy_count, quantity, pointers.",
-        "Supported edit_mode values are: anchor, named_function, write_file, append, prepend, delete_file, copy_file, create_files, scaffold_files, rename_symbol.",
-        "You are proposing a precise file edit for a coding agent.",
+        "Return only JSON with keys: target_path, anchor, replacement, edit_mode, copy_count, quantity.",
+        "Supported edit_mode values: write_file, search_and_replace, anchor, append, prepend, delete_file, copy_file, create_files, scaffold_files, rename_symbol.",
+        "You are proposing a file edit. Use whatever mode fits best.",
+        "For write_file: replacement must be the COMPLETE file — all existing content plus changes. Do not drop anything the instruction didn't ask to remove.",
         f"Instruction: {state.get('instruction', '').strip()}",
         f"Current target path: {state.get('target_path', '')}",
     ]
@@ -99,37 +101,23 @@ def build_proposal_prompt(state: ShipyardState) -> str:
         lines.append("Current function source:")
         lines.append(state["current_function_source"])
 
-    if code_graph_status:
-        lines.append("Code graph status:")
-        for key in ("ready", "query_mode", "refresh_required", "context_collected", "reason"):
-            value = code_graph_status.get(key)
-            if value not in (None, ""):
-                lines.append(f"- {key}: {value}")
-
     if state.get("file_before") is not None:
         lines.append("Current file contents:")
         lines.append(state.get("file_before", ""))
 
     tool_outputs = list(state.get("tool_outputs", []) or context.get("tool_outputs", []) or [])
     if tool_outputs:
-        lines.append("Previous tool outputs:")
-        for output in tool_outputs[-4:]:
+        # Prefer outputs about the current target file; cap at 2 to avoid context noise
+        target = state.get("target_path") or ""
+        relevant = [o for o in tool_outputs if isinstance(o, dict) and target and str(o.get("target_path", "")).endswith(Path(target).name)]
+        other = [o for o in tool_outputs if o not in relevant]
+        prioritized = (relevant + other)[-2:]  # at most 2, target-file outputs first
+        lines.append("Previous tool outputs (most recent relevant):")
+        for output in prioritized:
             lines.append(f"- {output}")
 
-    lines.append("If file_hint exists, prefer it as target_path.")
-    lines.append("Use anchor for localized replacements, rename_symbol for file-local whole-word renames, write_file for full file replacement, append for adding to the end, prepend for adding to the beginning, delete_file for deleting a file, copy_file for creating sibling copies of an existing file, and scaffold_files for small explicit multi-file repo scaffolds.")
-    lines.append("For named_function mode, return the full replacement function body in replacement.")
-    lines.append("For write_file, append, and prepend, put the full content in replacement and leave anchor null.")
-    lines.append("For copy_file, set copy_count to the number of copies and leave anchor and replacement null.")
-    lines.append("For create_files, set quantity to the number of new files to create, use target_path as the first file path, and leave anchor null. Use replacement as the initial file contents, or an empty string for blank files.")
-    lines.append("For scaffold_files, set files to a list of {path, content} objects that covers every named file in the prompt.")
-    lines.append("For rename_symbol, set anchor to the old symbol name and replacement to the new symbol name.")
-    lines.append("If the user is replacing an identifier-like token in a file, prefer rename_symbol over anchor.")
-    lines.append("Use anchor only when the user is clearly targeting a specific literal snippet or block.")
-    lines.append("For localized edits, prefer exact pointers as a list of {start, end} spans into the current file contents.")
-    lines.append("Pointers must be 0-based character offsets into the exact current file string, with end exclusive.")
-    lines.append("If the user asks to change a literal everywhere in one file, return pointers for each occurrence.")
-    lines.append("If the user asks to remove repeated blocks except one, read the whole file first and return an anchor or pointers that remove all extra repeated lines, not just the first local match.")
+    if state.get("context", {}).get("file_hint"):
+        lines.append("If file_hint exists, prefer it as target_path.")
     return "\n".join(lines).strip()
 
 

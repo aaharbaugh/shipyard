@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .action_planner import PlanningCancelledError, plan_actions
-from .graph import build_graph
+from .action_planner import PlanningCancelledError, plan_actions, plan_next_batch, replan_remaining_actions, request_exploration_files
+from .context_explorer import build_broad_context, load_context_files
+from .graph import build_graph, _check_file_syntax as _check_file_syntax_fast
 from .intent_parser import parse_instruction
 from .langsmith_config import build_langgraph_config
 from .plan_feature import generate_spec_bundle
@@ -22,6 +23,32 @@ from .session_store import SessionStore
 from .state import ShipyardState
 from .tools.code_graph import inspect_code_graph_status, sync_live_code_graph
 from .tracing import write_trace, write_troubleshooting_log
+from .workspaces import set_session_workspace
+
+
+def _detect_workspace_syntax_errors(session_id: str | None) -> dict[str, str]:
+    """Scan the session workspace for files with syntax errors. Returns {rel_path: error}."""
+    from .workspaces import get_session_workspace
+    _CHECKABLE = {".py", ".js", ".mjs", ".cjs", ".ts", ".tsx"}
+    _IGNORED = {".git", ".venv", "__pycache__", "node_modules", ".pytest_cache", "dist", "build"}
+    errors: dict[str, str] = {}
+    try:
+        root = get_session_workspace(session_id)
+        if not root.exists():
+            return {}
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            if any(part in _IGNORED for part in p.relative_to(root).parts):
+                continue
+            if p.suffix.lower() not in _CHECKABLE:
+                continue
+            err = _check_file_syntax_fast(str(p))
+            if err:
+                errors[str(p.relative_to(root))] = err
+    except Exception:
+        pass
+    return errors
 
 
 def parse_user_input(raw: str) -> ShipyardState:
@@ -74,7 +101,68 @@ def _normalize_payload(payload: dict[str, Any]) -> ShipyardState:
         "edit_attempts": int(payload.get("edit_attempts", 0) or 0),
         "max_edit_attempts": int(payload.get("max_edit_attempts", 2) or 2),
         "verification_commands": list(payload.get("verification_commands", []) or []),
+        "wide_impact_approved": bool(payload.get("wide_impact_approved", False)),
     }
+
+
+def _record_file_transaction(
+    transactions: list[dict[str, Any]],
+    result: ShipyardState,
+) -> list[dict[str, Any]]:
+    target_path = result.get("target_path")
+    snapshot_path = result.get("snapshot_path")
+    if not target_path or not snapshot_path:
+        return transactions
+    resolved_target = str(Path(str(target_path)).resolve())
+    updated = [dict(item) for item in transactions if str(item.get("target_path")) != resolved_target]
+    updated.append(
+        {
+            "target_path": resolved_target,
+            "snapshot_path": str(snapshot_path),
+            "target_existed_before_edit": bool(result.get("target_existed_before_edit", True)),
+        }
+    )
+    return updated
+
+
+def _default_step_retries(action_class: str) -> int:
+    return 1 if action_class == "inspect" else 0
+
+
+def _is_transient_verification_failure(result: ShipyardState) -> bool:
+    if "timed out" in str(result.get("error") or "").lower():
+        return True
+    for verification in list(result.get("verification_results", []) or []):
+        if not isinstance(verification, dict):
+            continue
+        returncode = verification.get("returncode")
+        stderr = str(verification.get("stderr") or "").lower()
+        stdout = str(verification.get("stdout") or "").lower()
+        combined = f"{stderr}\n{stdout}"
+        if returncode in {124, 137, 143}:
+            return True
+        transient_markers = ("temporar", "timed out", "connection reset", "try again", "resource busy")
+        if any(marker in combined for marker in transient_markers):
+            return True
+    return False
+
+
+def _should_retry_step(action_class: str, result: ShipyardState, attempt: int, max_retries: int) -> bool:
+    if attempt > max_retries:
+        return False
+    latest_status = str(result.get("status") or "")
+    if action_class == "inspect":
+        return latest_status in {"failed", "verification_failed", "invalid_proposal", "edit_blocked"}
+    if action_class == "verify":
+        return latest_status == "verification_failed" and _is_transient_verification_failure(result)
+    return False
+
+
+def _step_status_for_result(result: ShipyardState) -> str:
+    status = str(result.get("status") or "unknown")
+    if status == "edited" and result.get("no_op"):
+        return "edit_skipped"
+    return status
 
 
 def _coerce_optional_str(value: Any) -> str | None:
@@ -91,6 +179,7 @@ def run_once(
 ) -> ShipyardState:
     state = _sanitize_stale_target_request(state)
     state["session_id"] = _ensure_session_id(state.get("session_id"))
+    _register_requested_workspace(state)
     state["request_instruction"] = str(state.get("request_instruction") or state.get("instruction") or "")
     action_plan: dict[str, Any] | None = None
     try:
@@ -100,14 +189,83 @@ def run_once(
         spec_bundle = generate_spec_bundle(state.get("session_id"), state.get("instruction", ""))
         if spec_bundle.get("created") or spec_bundle.get("mode"):
             state["spec_bundle"] = spec_bundle
+        print(f"[run] planning  instruction={state.get('instruction', '')[:80]!r}", flush=True)
         _emit_progress(progress_callback, "planning", {"instruction": state.get("instruction")})
+        # Build broad repo context once before planning so the LLM sees the file tree
+        # and key file contents when generating the action plan.
+        state["broad_context"] = build_broad_context(state.get("session_id"), state.get("instruction", ""))
+        history = session_store.load_history(state["session_id"])
+        if isinstance(history, list) and history:
+            state["session_journal"] = history[-5:]
+        # Skip exploration when the caller has already named the target file
+        # or when broad_context already sampled files — the extra LLM call
+        # (using nano model) is pure overhead in these cases.
+        broad_has_files = bool((state.get("broad_context") or {}).get("sampled_files"))
+        if not state.get("target_path") and not broad_has_files:
+            explore_paths = request_exploration_files(state)
+            if explore_paths:
+                state["live_file_context"] = load_context_files(explore_paths, max_files=6, max_content=4000)
+        # Clear stale tool_outputs from prior runs. They accumulate in the session
+        # context and mislead the LLM into thinking prior failures are still relevant.
+        # The session_journal already captures what happened in prior runs.
+        if state.get("tool_outputs"):
+            state["tool_outputs"] = []
+        if state.get("context") and state["context"].get("tool_outputs"):
+            state["context"] = {**state["context"], "tool_outputs": []}
+        # Detect pre-existing syntax errors in workspace files so the planning LLM knows
+        # to use write_file instead of anchor edits on broken files.
+        _syntax_errors = _detect_workspace_syntax_errors(state.get("session_id"))
+        if _syntax_errors:
+            _notes = "\n".join(f"  {f}: {e[:120]}" for f, e in _syntax_errors.items())
+            _ctx = dict(state.get("context") or {})
+            _existing = _ctx.get("helper_notes", "")
+            _ctx["helper_notes"] = (
+                f"{_existing}\nWARNING: These workspace files have pre-existing syntax errors.\n"
+                f"Plan write_file rewrites (not anchor edits) for them:\n{_notes}"
+            ).strip()
+            state["context"] = _ctx
         action_plan = _plan_actions_with_cancellation(state)
+        actions_count = len(action_plan.get("actions") or [])
+        provider = action_plan.get("provider") or "?"
+        print(f"[run] plan ready  provider={provider} steps={actions_count}", flush=True)
         if not action_plan.get("is_valid", True):
             result = _invalid_action_plan_result(state, action_plan)
             result = _persist_result(session_store, result)
             _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
             return result
         result = _run_action_plan(app, state, action_plan, progress_callback)
+        # Chunked planning: if the LLM indicated more batches are needed, keep planning
+        # and executing with full context of what was done so far.
+        batch_limit = 8  # guard against runaway chunked plans
+        batch_count = 1
+        while action_plan.get("needs_more_batches") and batch_count < batch_limit:
+            batch_count += 1
+            _emit_progress(progress_callback, "planning",
+                {"instruction": state.get("instruction"), "batch": batch_count})
+            next_batch = plan_next_batch(
+                {**state, **result},
+                completed_steps=list(result.get("action_steps") or []),
+                tool_outputs=list(result.get("tool_outputs") or []),
+                changed_files=list(result.get("changed_files") or []),
+                batch_size=int(state.get("plan_batch_size") or 4),
+            )
+            if not next_batch or not next_batch.get("actions"):
+                break
+            action_plan = next_batch
+            batch_result = _run_action_plan(
+                app,
+                {**state, **result},
+                action_plan,
+                progress_callback,
+            )
+            # Merge batch result into overall result
+            result = {
+                **result,
+                **batch_result,
+                "changed_files": list({*list(result.get("changed_files") or []), *list(batch_result.get("changed_files") or [])}),
+                "action_steps": list(result.get("action_steps") or []) + list(batch_result.get("action_steps") or []),
+                "tool_outputs": list(result.get("tool_outputs") or []) + list(batch_result.get("tool_outputs") or []),
+            }
         if spec_bundle:
             result["spec_bundle"] = spec_bundle
         _emit_progress(progress_callback, "result_ready", {"status": result.get("status")})
@@ -155,6 +313,13 @@ def _sanitize_stale_target_request(state: ShipyardState) -> ShipyardState:
     return sanitized
 
 
+def _register_requested_workspace(state: ShipyardState) -> None:
+    session_id = state.get("session_id")
+    context = state.get("context", {}) or {}
+    workspace_path = context.get("workspace_path")
+    set_session_workspace(session_id, workspace_path)
+
+
 def _run_action_plan(
     app,
     state: ShipyardState,
@@ -163,76 +328,187 @@ def _run_action_plan(
 ) -> ShipyardState:
     request_instruction = str(state.get("request_instruction") or state.get("instruction") or "")
     current_state: ShipyardState = dict(state)
+
+    # Inject pre-existing syntax errors into context so the LLM knows the file
+    # is already broken before planning any edits.
     actions = list(action_plan.get("actions", []) or [])
+    _primary_target = state.get("target_path") or (actions[0].get("target_path") if actions else None)
+    if _primary_target:
+        _tp = Path(str(_primary_target))
+        if _tp.is_file():
+            _pre_err = _check_file_syntax_fast(str(_tp))
+            if _pre_err:
+                current_state = {
+                    **current_state,
+                    "context": {
+                        **dict(current_state.get("context", {}) or {}),
+                        "pre_existing_syntax_errors": f"{_primary_target}: {_pre_err}",
+                        "helper_notes": (
+                            f"{current_state.get('context', {}).get('helper_notes', '')}\n"
+                            f"WARNING: Target file has pre-existing syntax errors. "
+                            f"Use write_file to rewrite it cleanly rather than anchor edits.\n{_pre_err}"
+                        ).strip(),
+                    },
+                }
     if not actions:
         actions = [{"instruction": state.get("instruction", "")}]
     aggregated_changed_files: list[str] = []
+    file_transactions: list[dict[str, Any]] = [dict(item) for item in list(state.get("file_transactions", []) or []) if isinstance(item, dict)]
     action_steps: list[dict[str, Any]] = []
     completed_step_ids: set[str] = set()
     latest_result: ShipyardState = dict(state)
     steps: list[str] = []
+    replan_count = 0
+    max_replans = 2
+    # While loop so we can splice in expand_to sub-actions and adaptive replan actions.
+    action_index = 0
 
-    for index, action in enumerate(actions, start=1):
+    while action_index < len(actions):
+        action = actions[action_index]
+        index = action_index + 1  # 1-based for display / step IDs
+
         cancel_check = current_state.get("cancel_check")
         if callable(cancel_check) and cancel_check():
-            latest_result = {
-                **current_state,
-                "status": "cancelled",
-                "error": "Run cancelled.",
-            }
+            latest_result = {**current_state, "status": "cancelled", "error": "Run cancelled."}
             break
+
         step_id = str(action.get("id") or f"step-{index}")
         depends_on = list(action.get("depends_on", []) or [])
         inputs_from = list(action.get("inputs_from", []) or [])
         step = str(action.get("instruction") or "").strip() or state.get("instruction", "")
         steps.append(step)
-        unmet_dependencies = [dependency for dependency in depends_on if dependency not in completed_step_ids]
+
+        unmet_dependencies = [dep for dep in depends_on if dep not in completed_step_ids]
         if unmet_dependencies:
-            latest_result = {
-                **current_state,
-                "status": "blocked",
-                "error": f"Unmet step dependencies: {', '.join(unmet_dependencies)}",
-                "human_gate": {
-                    "status": "blocked",
-                    "reason": f"Unmet step dependencies: {', '.join(unmet_dependencies)}",
-                    "action": "inspect_plan_dependencies",
-                    "prompt": "Review the plan dependencies, then retry.",
-                },
-            }
-            action_steps.append(
-                {
-                    "id": step_id,
-                    "instruction": step,
-                    "action_class": action.get("action_class"),
-                    "edit_mode": action.get("edit_mode"),
-                    "target_path": action.get("target_path"),
-                    "depends_on": depends_on,
-                    "inputs_from": inputs_from,
-                    "status": "blocked",
-                    "changed_files": [],
-                    "no_op": True,
+            # Check whether each unmet dep actually failed (vs never ran)
+            _failed_status = {"failed_after_retries", "edit_blocked", "failed", "invalid_proposal"}
+            failed_dep_msgs = []
+            for dep_id in unmet_dependencies:
+                for prev in action_steps:
+                    if str(prev.get("id")) == dep_id and prev.get("status") in _failed_status:
+                        prev_err = prev.get("error") or prev.get("status") or "unknown error"
+                        failed_dep_msgs.append(f"Step '{dep_id}' failed: {prev_err}")
+                        break
+            if failed_dep_msgs:
+                error_msg = "; ".join(failed_dep_msgs)
+                latest_result = {
+                    **current_state,
+                    "status": "failed",
+                    "error": error_msg,
                 }
-            )
+            else:
+                error_msg = f"Unmet step dependencies: {', '.join(unmet_dependencies)}"
+                latest_result = {
+                    **current_state,
+                    "status": "failed",
+                    "error": error_msg,
+                }
+            action_steps.append({
+                "id": step_id, "instruction": step,
+                "action_class": action.get("action_class"), "edit_mode": action.get("edit_mode"),
+                "target_path": action.get("target_path"), "depends_on": depends_on,
+                "inputs_from": inputs_from, "status": "blocked", "changed_files": [], "no_op": True,
+            })
             break
+
+        # --- Parallel batch detection ---
+        # Check if this action and subsequent ones can run in parallel
+        # (different target files, no cross-dependencies, same action_class).
+        batch_indices = _find_parallel_batch(actions, action_index, completed_step_ids)
+        if len(batch_indices) > 1:
+            batch_labels = ", ".join(
+                f"{actions[i].get('edit_mode', '?')}:{actions[i].get('target_path', '?')}"
+                for i in batch_indices
+            )
+            print(f"[parallel batch] {len(batch_indices)} steps: {batch_labels}", flush=True)
+            _emit_progress(progress_callback, "parallel_batch", {
+                "step_count": len(batch_indices),
+                "step_ids": [str(actions[i].get("id") or f"step-{i+1}") for i in batch_indices],
+            })
+            batch_results = _execute_batch_parallel(
+                app, actions, batch_indices, current_state, state,
+                completed_step_ids, len(actions), progress_callback,
+            )
+            for b_idx, b_action, b_result in batch_results:
+                b_index = b_idx + 1
+                b_step_id = str(b_action.get("id") or f"step-{b_index}")
+                b_step = str(b_action.get("instruction") or "").strip() or state.get("instruction", "")
+                b_status = b_result.get("status") or "?"
+                b_changed = b_result.get("changed_files") or []
+                b_no_op = b_result.get("no_op")
+                b_label = "no-op" if b_no_op else (f"{len(b_changed)} file(s) changed" if b_changed else b_status)
+                print(f"  [{b_step_id}] {b_action.get('edit_mode', '?')} {b_action.get('target_path', '')} → {b_label}", flush=True)
+
+                step_changed_files = list(b_changed)
+                aggregated_changed_files.extend(step_changed_files)
+                file_transactions = _record_file_transaction(file_transactions, b_result)
+                tool_outputs = list(current_state.get("tool_outputs", []) or [])
+                if b_result.get("tool_output"):
+                    tool_outputs.append(b_result["tool_output"])
+
+                # Merge file content cache across batch results (reads populate it)
+                merged_cache = {
+                    **dict(current_state.get("file_content_cache") or {}),
+                    **dict(b_result.get("file_content_cache") or {}),
+                }
+                current_state = {
+                    **current_state,
+                    **b_result,
+                    "tool_outputs": tool_outputs,
+                    "file_transactions": [dict(item) for item in file_transactions],
+                    "file_content_cache": merged_cache,
+                    "context": {
+                        **dict(current_state.get("context", {}) or {}),
+                        **dict(b_result.get("context", {}) or {}),
+                        "tool_outputs": tool_outputs,
+                    },
+                }
+                b_step_status = _step_status_for_result(b_result)
+                action_steps.append({
+                    "id": b_step_id, "instruction": b_step,
+                    "action_class": b_action.get("action_class"),
+                    "edit_mode": b_action.get("edit_mode"),
+                    "target_path": b_result.get("target_path"),
+                    "status": b_step_status,
+                    "changed_files": step_changed_files,
+                    "no_op": bool(b_no_op),
+                    "parallel_batch": True,
+                })
+                if b_step_status in {"edited", "verified", "observed", "edit_skipped"}:
+                    completed_step_ids.add(b_step_id)
+
+            latest_result = current_state
+            action_index = batch_indices[-1] + 1
+            continue
+        # --- End parallel batch ---
+
         _emit_progress(
             progress_callback,
             "verifying" if action.get("action_class") == "verify" else "lead_agent",
             {
-                "instruction": step,
-                "step_index": index,
-                "step_count": len(actions),
-                "step_id": step_id,
-                "role": _infer_subagent_role(action),
+                "instruction": step, "step_index": index, "step_count": len(actions),
+                "step_id": step_id, "role": _infer_subagent_role(action),
                 "agent_type": _infer_subagent_type(action),
                 "allowed_actions": list(action.get("allowed_actions", [])) or ([action.get("edit_mode")] if action.get("edit_mode") else []),
-                "depends_on": depends_on,
-                "inputs_from": inputs_from,
+                "depends_on": depends_on, "inputs_from": inputs_from,
             },
         )
-        max_retries = int(action.get("max_retries") or (1 if action.get("action_class") in {"inspect", "verify"} else 0))
+
+        action_class = str(action.get("action_class") or "").strip()
+        max_retries = int(action.get("max_retries") if action.get("max_retries") is not None else _default_step_retries(action_class))
+        edit_mode_label = action.get("edit_mode") or action_class or "?"
+        target_label = action.get("target_path") or ""
+        print(
+            f"[step {index}/{len(actions)}] {edit_mode_label}"
+            + (f"  {target_label}" if target_label else ""),
+            flush=True,
+        )
         attempt = 0
         while True:
             attempt += 1
+            # Clear snapshot_path for non-mutate steps (verify_command, run_command, etc.)
+            # so recover_or_finish doesn't accidentally revert a prior step's edit.
+            _clear_snapshot = action_class != "mutate"
             step_state: ShipyardState = {
                 **current_state,
                 "request_instruction": request_instruction,
@@ -240,6 +516,7 @@ def _run_action_plan(
                 "task_id": step_id,
                 "target_path": action.get("target_path"),
                 "edit_mode": action.get("edit_mode"),
+                **({"snapshot_path": None} if _clear_snapshot else {}),
                 "anchor": action.get("anchor"),
                 "replacement": action.get("replacement"),
                 "pattern": action.get("pattern"),
@@ -254,34 +531,52 @@ def _run_action_plan(
                 "preplanned_action": action,
                 "occurrence_selector": action.get("occurrence_selector"),
                 "changed_files": [],
+                "file_transactions": [dict(item) for item in file_transactions],
                 "depends_on": depends_on,
                 "inputs_from": inputs_from,
                 "timeout_seconds": action.get("timeout_seconds"),
                 "max_retries": max_retries,
+                "tool_name": action.get("tool_name"),
+                "tool_source": action.get("tool_source"),
+                "tool_args": action.get("tool_args") or {},
+                "verification_retry_count": max(attempt - 1, 0) if action_class == "verify" else int(current_state.get("verification_retry_count") or 0),
             }
             latest_result = _invoke_step_with_timeout(
-                app,
-                step_state,
-                state.get("session_id"),
-                step,
-                index,
-                len(actions),
-                int(action.get("timeout_seconds") or 45),
+                app, step_state, state.get("session_id"), step, index, len(actions),
+                int(action.get("timeout_seconds") or 90),
             )
-            if latest_result.get("status") in {"failed", "verification_failed", "invalid_proposal", "edit_blocked"} and attempt <= max_retries:
-                _emit_progress(
-                    progress_callback,
-                    "step_retry",
-                    {"instruction": step, "step_index": index, "attempt": attempt + 1, "step_id": step_id},
-                )
+            result_status = latest_result.get("status") or "?"
+            verification_results = latest_result.get("verification_results") or []
+            if verification_results:
+                passed = sum(1 for r in verification_results if r.get("returncode") == 0)
+                failed = len(verification_results) - passed
+                print(f"  verify: {passed} passed, {failed} failed", flush=True)
+            if result_status not in {"edited", "verified", "observed", "edit_skipped"}:
+                err = latest_result.get("error") or ""
+                print(f"  → {result_status}" + (f": {err[:120]}" if err else ""), flush=True)
+            else:
+                changed = latest_result.get("changed_files") or []
+                no_op = latest_result.get("no_op")
+                label = "no-op" if no_op else (f"{len(changed)} file(s) changed" if changed else result_status)
+                print(f"  → {label}", flush=True)
+            if _should_retry_step(action_class, latest_result, attempt, max_retries):
+                _emit_progress(progress_callback, "step_retry",
+                    {"instruction": step, "step_index": index, "attempt": attempt + 1, "step_id": step_id})
                 continue
             break
+
+        # expand_to: search_then_edit and similar actions return sub-actions to splice in
+        expand_to = list(latest_result.pop("expand_to", None) or [])
+        if expand_to:
+            actions[action_index + 1:action_index + 1] = expand_to
+
         step_changed_files = list(latest_result.get("changed_files", []) or [])
         if not step_changed_files and not latest_result.get("no_op") and latest_result.get("target_path"):
             target = Path(str(latest_result["target_path"]))
             if target.exists() and target.is_file():
                 step_changed_files = [str(target.resolve())]
         aggregated_changed_files.extend(step_changed_files)
+        file_transactions = _record_file_transaction(file_transactions, latest_result)
         tool_outputs = list(current_state.get("tool_outputs", []) or [])
         if latest_result.get("tool_output"):
             tool_outputs.append(latest_result["tool_output"])
@@ -289,59 +584,96 @@ def _run_action_plan(
             **current_state,
             **latest_result,
             "tool_outputs": tool_outputs,
+            "file_transactions": [dict(item) for item in file_transactions],
+            "file_content_cache": {
+                **dict(current_state.get("file_content_cache") or {}),
+                **dict(latest_result.get("file_content_cache") or {}),
+            },
             "context": {
                 **dict(current_state.get("context", {}) or {}),
                 **dict(latest_result.get("context", {}) or {}),
                 "tool_outputs": tool_outputs,
             },
         }
-        action_steps.append(
-            {
-                "id": step_id,
-                "instruction": step,
-                "action_class": action.get("action_class"),
-                "edit_mode": action.get("edit_mode"),
-                "target_path": latest_result.get("target_path"),
-                "anchor": action.get("anchor"),
-                "pattern": action.get("pattern"),
-                "command": action.get("command"),
-                "pointers": action.get("pointers"),
-                "replacement_preview": str(action.get("replacement") or "")[:120],
-                "depends_on": depends_on,
-                "inputs_from": inputs_from,
-                "timeout_seconds": action.get("timeout_seconds"),
-                "max_retries": max_retries,
-                "status": latest_result.get("status"),
-                "changed_files": step_changed_files,
-                "no_op": bool(latest_result.get("no_op")),
-            }
-        )
-        if latest_result.get("status") in {"edited", "verified", "observed"}:
+
+        step_status = _step_status_for_result(latest_result)
+        action_steps.append({
+            "id": step_id, "instruction": step, "action_class": action_class,
+            "edit_mode": action.get("edit_mode"), "target_path": latest_result.get("target_path"),
+            "anchor": action.get("anchor"), "pattern": action.get("pattern"),
+            "command": action.get("command"), "pointers": action.get("pointers"),
+            "replacement_preview": str(action.get("replacement") or "")[:120],
+            "depends_on": depends_on, "inputs_from": inputs_from,
+            "timeout_seconds": action.get("timeout_seconds"), "max_retries": max_retries,
+            "retry_count": max(attempt - 1, 0), "status": step_status,
+            "changed_files": step_changed_files, "no_op": bool(latest_result.get("no_op")),
+        })
+
+        if step_status in {"edited", "verified", "observed", "edit_skipped"}:
             completed_step_ids.add(step_id)
-        if latest_result.get("status") not in {"edited", "verified", "observed"}:
-            for remaining_index, remaining_action in enumerate(actions[index:], start=index + 1):
-                action_steps.append(
-                    {
-                        "id": str(remaining_action.get("id") or f"step-{remaining_index}"),
-                        "instruction": str(remaining_action.get("instruction") or "").strip() or "Pending step",
-                        "action_class": remaining_action.get("action_class"),
-                        "edit_mode": remaining_action.get("edit_mode"),
-                        "target_path": remaining_action.get("target_path"),
-                        "anchor": remaining_action.get("anchor"),
-                        "pattern": remaining_action.get("pattern"),
-                        "command": remaining_action.get("command"),
-                        "pointers": remaining_action.get("pointers"),
-                        "replacement_preview": str(remaining_action.get("replacement") or "")[:120],
-                        "depends_on": list(remaining_action.get("depends_on", []) or []),
-                        "inputs_from": list(remaining_action.get("inputs_from", []) or []),
-                        "timeout_seconds": remaining_action.get("timeout_seconds"),
-                        "max_retries": remaining_action.get("max_retries"),
-                        "status": "skipped",
-                        "changed_files": [],
-                        "no_op": True,
-                    }
-                )
+            action_index += 1
+            continue
+
+        # Wide-impact gate triggered — surface human_gate and hard-stop immediately
+        if step_status == "needs_approval":
+            for remaining_index, remaining_action in enumerate(actions[action_index + 1:], start=action_index + 2):
+                action_steps.append({
+                    "id": str(remaining_action.get("id") or f"step-{remaining_index}"),
+                    "instruction": str(remaining_action.get("instruction") or "").strip() or "Pending step",
+                    "action_class": remaining_action.get("action_class"),
+                    "edit_mode": remaining_action.get("edit_mode"),
+                    "target_path": remaining_action.get("target_path"),
+                    "status": "skipped",
+                    "no_op": True,
+                })
             break
+
+        # Step failed — try adaptive replan before giving up, but only for
+        # recoverable failures.  Exhausted-retry failures are terminal: the step
+        # was already retried the maximum number of times, so replanning cannot
+        # help and would only obscure the real error for downstream steps.
+        remaining = actions[action_index + 1:]
+        if remaining and replan_count < max_replans and step_status != "failed_after_retries":
+            _emit_progress(progress_callback, "replanning",
+                {"step_id": step_id, "step_index": index, "replan_count": replan_count + 1})
+            failed_step_info = {
+                "id": step_id, "instruction": step,
+                "edit_mode": action.get("edit_mode"),
+                "error": latest_result.get("error") or step_status,
+                "status": step_status,
+            }
+            revised = replan_remaining_actions(
+                current_state,
+                completed_steps=action_steps,
+                failed_step=failed_step_info,
+                remaining_actions=remaining,
+            )
+            if revised is not None:
+                actions[action_index + 1:] = revised
+                replan_count += 1
+                action_index += 1  # skip the failed step, continue with revised plan
+                continue
+
+        # Hard stop: mark all remaining as skipped
+        for remaining_index, remaining_action in enumerate(actions[action_index + 1:], start=action_index + 2):
+            action_steps.append({
+                "id": str(remaining_action.get("id") or f"step-{remaining_index}"),
+                "instruction": str(remaining_action.get("instruction") or "").strip() or "Pending step",
+                "action_class": remaining_action.get("action_class"),
+                "edit_mode": remaining_action.get("edit_mode"),
+                "target_path": remaining_action.get("target_path"),
+                "anchor": remaining_action.get("anchor"),
+                "pattern": remaining_action.get("pattern"),
+                "command": remaining_action.get("command"),
+                "pointers": remaining_action.get("pointers"),
+                "replacement_preview": str(remaining_action.get("replacement") or "")[:120],
+                "depends_on": list(remaining_action.get("depends_on", []) or []),
+                "inputs_from": list(remaining_action.get("inputs_from", []) or []),
+                "timeout_seconds": remaining_action.get("timeout_seconds"),
+                "max_retries": remaining_action.get("max_retries"),
+                "status": "skipped", "changed_files": [], "no_op": True,
+            })
+        break
 
     had_material_edit = any(
         step.get("status") in {"edited", "verified"} and not step.get("no_op")
@@ -351,10 +683,9 @@ def _run_action_plan(
     if aggregated_changed_files:
         seen: set[str] = set()
         for path in aggregated_changed_files:
-            if path in seen:
-                continue
-            deduped.append(path)
-            seen.add(path)
+            if path not in seen:
+                deduped.append(path)
+                seen.add(path)
     latest_result["changed_files"] = deduped
     if latest_result.get("status") == "observed" and had_material_edit:
         latest_result["status"] = "edited"
@@ -364,8 +695,139 @@ def _run_action_plan(
     latest_result["instruction_steps"] = steps
     latest_result["action_steps"] = action_steps
     latest_result["action_plan"] = action_plan
+    latest_result["file_transactions"] = file_transactions
     latest_result["tasks"] = _merge_runtime_tasks(latest_result.get("tasks"), actions, action_steps)
     return latest_result
+
+
+def _find_parallel_batch(
+    actions: list[dict[str, Any]],
+    start_index: int,
+    completed_step_ids: set[str],
+) -> list[int]:
+    """Find consecutive actions starting at start_index that can run in parallel.
+
+    Actions are parallelizable when they:
+    - Target different files (or no file)
+    - Have no unmet depends_on or inputs_from
+    - Are all the same action_class (e.g., all mutate or all inspect)
+
+    Returns list of action indices in the batch (at least 1 element).
+    """
+    if start_index >= len(actions):
+        return []
+    first = actions[start_index]
+    first_class = first.get("action_class") or ""
+    first_target = str(first.get("target_path") or "")
+    # Can't parallelize if the first action has no target (ambiguous scope)
+    if not first_target:
+        return [start_index]
+    batch = [start_index]
+    seen_targets: set[str] = {first_target}
+
+    for i in range(start_index + 1, len(actions)):
+        action = actions[i]
+        # Must be same action_class
+        if (action.get("action_class") or "") != first_class:
+            break
+        # Must have no unmet dependencies
+        deps = set(action.get("depends_on", []) or []) | set(action.get("inputs_from", []) or [])
+        # Allow deps on completed steps, but not on steps in this batch
+        batch_ids = {str(actions[j].get("id") or f"step-{j+1}") for j in batch}
+        if deps - completed_step_ids - batch_ids:
+            break  # has unmet deps outside batch
+        if deps & batch_ids:
+            break  # depends on something in this batch — must wait
+        # Must target a different file (and must have a target)
+        target = str(action.get("target_path") or "")
+        if not target:
+            break  # no target — can't parallelize safely
+        if target in seen_targets:
+            break  # same file — can't parallelize
+        seen_targets.add(target)
+        batch.append(i)
+
+    return batch
+
+
+def _execute_batch_parallel(
+    app,
+    actions: list[dict[str, Any]],
+    action_indices: list[int],
+    current_state: ShipyardState,
+    state: ShipyardState,
+    completed_step_ids: set[str],
+    total_actions: int,
+    progress_callback: Callable[[str, dict[str, Any] | None], None] | None = None,
+) -> list[tuple[int, dict[str, Any], ShipyardState]]:
+    """Execute a batch of independent actions in parallel.
+
+    Returns list of (action_index, action, result) tuples in order.
+    """
+    request_instruction = str(state.get("request_instruction") or state.get("instruction") or "")
+
+    def _run_one(action_index: int) -> tuple[int, dict[str, Any], ShipyardState]:
+        action = actions[action_index]
+        index = action_index + 1
+        step_id = str(action.get("id") or f"step-{index}")
+        step = str(action.get("instruction") or "").strip() or state.get("instruction", "")
+        action_class = action.get("action_class") or ""
+        max_retries = int(action.get("max_retries") or (2 if action_class == "mutate" else 0))
+        _clear_snapshot = action_class != "mutate"
+
+        step_state: ShipyardState = {
+            **current_state,
+            "request_instruction": request_instruction,
+            "instruction": step,
+            "task_id": step_id,
+            "target_path": action.get("target_path"),
+            "edit_mode": action.get("edit_mode"),
+            **({"snapshot_path": None} if _clear_snapshot else {}),
+            "anchor": action.get("anchor"),
+            "replacement": action.get("replacement"),
+            "pattern": action.get("pattern"),
+            "command": action.get("command"),
+            "pointers": action.get("pointers"),
+            "quantity": action.get("quantity"),
+            "copy_count": action.get("copy_count"),
+            "files": action.get("files"),
+            "source_path": action.get("source_path"),
+            "destination_path": action.get("destination_path"),
+            "paths": action.get("paths"),
+            "preplanned_action": action,
+            "occurrence_selector": action.get("occurrence_selector"),
+            "changed_files": [],
+            "depends_on": list(action.get("depends_on", []) or []),
+            "inputs_from": list(action.get("inputs_from", []) or []),
+            "timeout_seconds": action.get("timeout_seconds"),
+            "max_retries": max_retries,
+            "tool_name": action.get("tool_name"),
+            "tool_source": action.get("tool_source"),
+            "tool_args": action.get("tool_args") or {},
+        }
+        result = _invoke_step_with_timeout(
+            app, step_state, state.get("session_id"), step, index, total_actions,
+            int(action.get("timeout_seconds") or 90),
+        )
+        return (action_index, action, result)
+
+    results: list[tuple[int, dict[str, Any], ShipyardState]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(action_indices), 4)) as executor:
+        futures = {executor.submit(_run_one, idx): idx for idx in action_indices}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                idx = futures[future]
+                action = actions[idx]
+                results.append((idx, action, {
+                    **current_state,
+                    "status": "failed",
+                    "error": f"Parallel execution error: {exc}",
+                }))
+    # Sort by original index order
+    results.sort(key=lambda x: x[0])
+    return results
 
 
 def _invoke_step_with_timeout(
@@ -405,12 +867,6 @@ def _invoke_step_with_timeout(
                     **step_state,
                     "status": "failed",
                     "error": f"Step timed out after {timeout_seconds} seconds.",
-                    "human_gate": {
-                        "status": "blocked",
-                        "reason": f"Step timed out after {timeout_seconds} seconds.",
-                        "action": "inspect_runtime_failure",
-                        "prompt": "Review the timed out step, then retry.",
-                    },
                 }
             try:
                 return future.result(timeout=min(0.25, max(remaining, 0.01)))
@@ -522,13 +978,6 @@ def _invalid_action_plan_result(state: ShipyardState, action_plan: dict[str, Any
         "status": "invalid_action_plan",
         "error": message,
         "action_plan": action_plan,
-        "human_gate": {
-            "status": "blocked",
-            "reason": message,
-            "action": "clarify_request",
-            "prompt": "Clarify the missing files or steps, then run again.",
-            "details": {"validation_errors": errors},
-        },
     }
 
 
@@ -542,12 +991,6 @@ def _failed_runtime_result(
         **state,
         "status": "failed",
         "error": error,
-        "human_gate": {
-            "status": "blocked",
-            "reason": error,
-            "action": "inspect_runtime_failure",
-            "prompt": "Review the runtime failure details, then retry.",
-        },
     }
     if action_plan:
         result["action_plan"] = action_plan
@@ -631,7 +1074,25 @@ def _sanitize_runtime_result(state: ShipyardState) -> ShipyardState:
         nested_status = graph_sync.get("status")
         if isinstance(nested_status, dict):
             nested_status.pop("details", None)
-    return cleaned
+    return _strip_nonserializable_runtime_values(cleaned)
+
+
+def _strip_nonserializable_runtime_values(value: Any) -> Any:
+    if callable(value):
+        return None
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            sanitized = _strip_nonserializable_runtime_values(item)
+            if sanitized is None:
+                continue
+            cleaned[key] = sanitized
+        return cleaned
+    if isinstance(value, list):
+        return [item for item in (_strip_nonserializable_runtime_values(item) for item in value) if item is not None]
+    if isinstance(value, tuple):
+        return [item for item in (_strip_nonserializable_runtime_values(item) for item in value) if item is not None]
+    return value
 
 
 def _attach_file_outcome(state: ShipyardState) -> ShipyardState:

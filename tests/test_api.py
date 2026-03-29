@@ -17,9 +17,12 @@ from shipyard.api import (
     queue_status,
     planner_status,
     graph_status,
+    workspace_folders,
+    workspace_select,
     workspace_status,
     workspace_temp,
     WorkspaceCreateRequest,
+    WorkspaceSelectRequest,
     get_session_history,
     get_session,
     health,
@@ -51,15 +54,16 @@ class ApiTests(unittest.TestCase):
     def test_workbench_returns_html(self) -> None:
         response = workbench()
         self.assertIn("Shipyard Workbench", response.body.decode("utf-8"))
-        self.assertIn("Side Panel", response.body.decode("utf-8"))
+        self.assertIn("tab-row", response.body.decode("utf-8"))
         self.assertIn("LLM planning is active", response.body.decode("utf-8"))
-        self.assertIn("Details", response.body.decode("utf-8"))
-        self.assertIn("Tasks", response.body.decode("utf-8"))
+        self.assertIn("Status", response.body.decode("utf-8"))
+        self.assertIn("Steps", response.body.decode("utf-8"))
         self.assertIn("Graph", response.body.decode("utf-8"))
-        self.assertIn("Raw", response.body.decode("utf-8"))
-        self.assertIn("Live Graph", response.body.decode("utf-8"))
-        self.assertIn("Connectivity", response.body.decode("utf-8"))
-        self.assertIn("New Temp Workspace", response.body.decode("utf-8"))
+        self.assertIn("Debug", response.body.decode("utf-8"))
+        self.assertIn("queue_timeline", response.body.decode("utf-8"))
+        self.assertIn("Queue Events", response.body.decode("utf-8"))
+        self.assertIn("Use Managed Workspace", response.body.decode("utf-8"))
+        self.assertIn("Use Selected Folder", response.body.decode("utf-8"))
         self.assertIn("Rebuild Graph", response.body.decode("utf-8"))
 
     def test_instruct_persists_session_result(self) -> None:
@@ -106,6 +110,45 @@ class ApiTests(unittest.TestCase):
             result = planner_status()
 
         self.assertEqual(result["default_mode"], "openai")
+
+    def test_workspace_status_includes_selection_and_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.api.list_repo_workspace_folders",
+            return_value=[{"path": ".", "label": ".", "resolved_path": tmpdir, "managed": False}],
+        ), patch(
+            "shipyard.api.get_session_workspace_selection",
+            return_value={"mode": "managed", "workspace_path": None, "workspace_label": "default", "managed": True, "exists": True, "resolved_path": tmpdir},
+        ):
+            result = workspace_status("api-test")
+
+        self.assertIn("folders", result)
+        self.assertIn("selection", result)
+
+    def test_workspace_folders_returns_repo_folder_choices(self) -> None:
+        with patch(
+            "shipyard.api.list_repo_workspace_folders",
+            return_value=[{"path": "shipyard", "label": "shipyard", "resolved_path": "/tmp/shipyard", "managed": False}],
+        ):
+            result = workspace_folders()
+
+        self.assertEqual(result["folders"][0]["path"], "shipyard")
+
+    def test_workspace_select_binds_session_to_repo_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.api.normalize_repo_workspace_path",
+            return_value=Path(tmpdir),
+        ), patch(
+            "shipyard.api.set_session_workspace",
+            return_value={"mode": "repo_folder", "workspace_path": "demo", "resolved_path": tmpdir, "managed": False, "exists": True},
+        ):
+            result = workspace_select(WorkspaceSelectRequest(session_id="api-test", workspace_path="demo"))
+
+        self.assertEqual(result["workspace_path"], "demo")
+
+    def test_workspace_select_rejects_invalid_folder(self) -> None:
+        with patch("shipyard.api.normalize_repo_workspace_path", return_value=None):
+            with self.assertRaises(HTTPException):
+                workspace_select(WorkspaceSelectRequest(session_id="api-test", workspace_path="../bad"))
 
     def test_queue_instruct_does_not_bypass_llm_when_openai_is_configured(self) -> None:
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(

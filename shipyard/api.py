@@ -12,7 +12,15 @@ from .graph import build_graph
 from .main import _normalize_payload, run_once
 from .runtime_cleanup import cleanup_runtime_data
 from .storage_paths import LOGS_ROOT, ensure_dir
-from .workspaces import get_session_workspace, get_workspace_status
+from .workspaces import (
+    get_managed_workspace,
+    get_session_workspace,
+    get_session_workspace_selection,
+    get_workspace_status,
+    list_repo_workspace_folders,
+    normalize_repo_workspace_path,
+    set_session_workspace,
+)
 from .session_store import SessionStore
 from .proposal import get_planner_status
 from .run_queue import RunQueue
@@ -33,6 +41,7 @@ class InstructionRequest(BaseModel):
     verification_commands: list[str] = Field(default_factory=list)
     edit_attempts: int = 0
     max_edit_attempts: int = 2
+    wide_impact_approved: bool = False
 
 
 class GitBranchRequest(BaseModel):
@@ -53,6 +62,11 @@ class GraphIndexRequest(BaseModel):
 class WorkspaceCreateRequest(BaseModel):
     prefix: str = "run"
     session_id: str | None = None
+
+
+class WorkspaceSelectRequest(BaseModel):
+    session_id: str
+    workspace_path: str | None = None
 
 
 class CleanupRequest(BaseModel):
@@ -543,6 +557,29 @@ WORKBENCH_HTML = """<!doctype html>
       color: var(--muted);
       font-size: 0.84rem;
     }
+    .session-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      width: 100%;
+      text-align: left;
+      padding: 10px 12px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(148,163,184,0.18);
+      border-radius: 10px;
+      color: var(--ink);
+    }
+    .session-item:hover {
+      background: rgba(255,255,255,0.1);
+    }
+    .session-excerpt {
+      font-size: 0.88rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
     ul {
       list-style: none;
       padding: 0;
@@ -678,10 +715,9 @@ WORKBENCH_HTML = """<!doctype html>
       word-break: break-word;
     }
     .message-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      font-size: 0.9rem;
+      display: grid;
+      gap: 4px;
+      font-size: 0.88rem;
     }
     .message-details {
       display: grid;
@@ -838,6 +874,94 @@ WORKBENCH_HTML = """<!doctype html>
         display: inline-flex;
       }
     }
+    .git-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(255, 255, 255, 0.07);
+      color: rgba(226, 232, 240, 0.82);
+      font-size: 0.8rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .git-badge.clean {
+      border-color: rgba(31, 180, 100, 0.28);
+      background: rgba(31, 180, 100, 0.1);
+      color: #6ee7b7;
+    }
+    .git-badge.dirty {
+      border-color: rgba(251, 191, 36, 0.28);
+      background: rgba(251, 191, 36, 0.08);
+      color: #fcd34d;
+    }
+    .verify-block {
+      display: grid;
+      gap: 6px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid;
+      font-size: 0.84rem;
+    }
+    .verify-block.pass {
+      border-color: rgba(31, 180, 100, 0.3);
+      background: rgba(31, 180, 100, 0.08);
+      color: #6ee7b7;
+    }
+    .verify-block.fail {
+      border-color: rgba(220, 60, 60, 0.3);
+      background: rgba(220, 60, 60, 0.08);
+      color: #fca5a5;
+    }
+    .verify-block-label {
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      opacity: 0.82;
+    }
+    .verify-line {
+      opacity: 0.9;
+      word-break: break-word;
+      font-family: ui-monospace, "Cascadia Code", monospace;
+    }
+    .gate-block {
+      display: grid;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(251, 191, 36, 0.32);
+      background: rgba(251, 191, 36, 0.07);
+    }
+    .gate-block-label {
+      font-size: 0.76rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #fcd34d;
+    }
+    .gate-block-text {
+      font-size: 0.9rem;
+      color: rgba(226, 232, 240, 0.9);
+      line-height: 1.4;
+    }
+    .gate-approve-btn {
+      width: auto;
+      align-self: start;
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: 1px solid rgba(251, 191, 36, 0.4);
+      background: rgba(251, 191, 36, 0.15);
+      color: #fcd34d;
+      font-weight: 700;
+      font-size: 0.88rem;
+      cursor: pointer;
+    }
+    .gate-approve-btn:hover {
+      background: rgba(251, 191, 36, 0.25);
+    }
   </style>
 </head>
 <body>
@@ -846,13 +970,16 @@ WORKBENCH_HTML = """<!doctype html>
       <section class="panel terminal-panel">
         <div class="terminal-header">
           <div>
-            <h1>Shipyard Terminal</h1>
-            <div class="muted" id="workspace_hint">Testing mode writes to Shipyard's managed workspace by default.</div>
+            <h1>Shipyard</h1>
+            <div class="muted" id="workspace_hint">Testing mode is attached to the managed workspace until you pick a repo folder.</div>
           </div>
-          <div class="terminal-dots" aria-hidden="true">
-            <span></span><span></span><span></span>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span id="git_badge" class="git-badge" style="display:none;"></span>
+            <div class="terminal-dots" aria-hidden="true">
+              <span></span><span></span><span></span>
+            </div>
+            <button class="ghost-button hidden-desktop" id="panel_toggle">Panel</button>
           </div>
-          <button class="ghost-button hidden-desktop" id="panel_toggle">Panel</button>
         </div>
         <div class="activity-scroll">
           <div class="activity-stream" id="activity_stream"></div>
@@ -865,7 +992,7 @@ Shift+Enter adds a new line.'></textarea>
             <div class="composer-hint">Enter to run. Shift+Enter for a new line.</div>
             <div class="composer-actions">
               <button class="ghost-button" id="clear_button">Clear</button>
-              <button class="ghost-button" id="workspace_button">New Temp Workspace</button>
+              <button class="ghost-button" id="workspace_button">Use Managed Workspace</button>
             </div>
           </div>
         </div>
@@ -874,43 +1001,51 @@ Shift+Enter adds a new line.'></textarea>
 
     <aside class="side-panel" id="side_panel">
       <div class="side-panel-header">
-        <h2>Side Panel</h2>
+        <h2>Shipyard</h2>
         <button class="secondary hidden-desktop" id="panel_close">Close</button>
       </div>
       <div class="tab-row">
-        <button class="active" data-tab="details">Details</button>
-        <button data-tab="tasks">Tasks</button>
+        <button class="active" data-tab="details">Status</button>
+        <button data-tab="tasks">Steps</button>
         <button data-tab="graph">Graph</button>
-        <button data-tab="sessions">Sessions</button>
-        <button data-tab="raw">Raw</button>
+        <button data-tab="sessions">History</button>
+        <button data-tab="raw">Debug</button>
       </div>
 
       <section class="tab-panel active" id="tab_details">
-        <div class="status">
-          <div>
-            <strong id="planner_title">Checking planner...</strong>
-            <span id="planner_subtitle">Please wait.</span>
-          </div>
-          <div id="planner_pill" class="pill">...</div>
+        <div class="card" style="border-color: rgba(21,101,216,0.22); background: rgba(21,101,216,0.04);">
+          <h3 style="color: var(--accent);">Queue</h3>
+          <div class="queue-live" id="queue_status"></div>
+          <div class="queue-timeline" id="queue_timeline"></div>
         </div>
-        <div class="card">
-          <h3>Workspace</h3>
-          <p class="muted" id="workspace_details">Testing writes default to the managed workspace unless you override the target path below.</p>
+        <div class="status" style="padding: 10px 14px;">
+          <div>
+            <strong id="planner_title" style="font-size:0.93rem;">Checking planner...</strong>
+            <span id="planner_subtitle" style="font-size:0.82rem; display:block; margin-top:2px;"></span>
+          </div>
+          <div id="planner_pill" class="pill" style="font-size:0.8rem; padding:4px 10px;">...</div>
         </div>
         <details>
-          <summary>Advanced Options</summary>
-          <div class="row">
+          <summary>Settings &amp; Workspace</summary>
+          <p class="muted" id="workspace_details" style="font-size:0.84rem; margin: 8px 0 4px;">Attach this session to the managed workspace or a folder from the current repo.</p>
+          <label for="workspace_select">Repo Folder</label>
+          <select id="workspace_select"></select>
+          <div class="actions" style="margin-top:8px;">
+            <button class="secondary" id="workspace_select_button">Use Selected Folder</button>
+            <button class="secondary" id="workspace_refresh_button">Refresh</button>
+          </div>
+          <div class="row" style="margin-top:12px;">
             <div>
               <label for="session_id">Session ID</label>
-              <input id="session_id" placeholder="optional-session-id" />
+              <input id="session_id" placeholder="auto-generated" />
             </div>
             <div>
               <label for="function_name">Function Name</label>
               <input id="function_name" placeholder="boot_system" />
             </div>
           </div>
-          <label for="target_path">Optional Target Path</label>
-          <input id="target_path" placeholder="/tmp/demo.py" />
+          <label for="target_path">Target Path</label>
+          <input id="target_path" placeholder="/path/to/file.py" />
           <div class="row">
             <div>
               <label for="edit_mode">Edit Mode</label>
@@ -935,18 +1070,13 @@ Shift+Enter adds a new line.'></textarea>
             </div>
           </div>
           <label for="verification_commands">Verification Commands</label>
-          <textarea class="compact-textarea" id="verification_commands" placeholder="python3 -m py_compile /tmp/demo.py"></textarea>
+          <textarea class="compact-textarea" id="verification_commands" placeholder="python3 -m py_compile /path/to/file.py"></textarea>
           <label for="context_json">Extra Context JSON</label>
-          <textarea class="compact-textarea" id="context_json" placeholder='{"file_hint":"/tmp/demo.py"}'></textarea>
+          <textarea class="compact-textarea" id="context_json" placeholder='{"file_hint":"/path/to/file.py"}'></textarea>
+          <div class="actions" style="margin-top:12px;">
+            <button class="secondary" id="cleanup_button">Clean Runtime Data</button>
+          </div>
         </details>
-        <div class="actions">
-          <button class="secondary" id="cleanup_button">Clean Runtime</button>
-        </div>
-        <div class="card">
-          <h3>Queue</h3>
-          <div class="queue-live" id="queue_status"></div>
-          <div class="queue-timeline" id="queue_timeline"></div>
-        </div>
       </section>
 
       <section class="tab-panel" id="tab_tasks">
@@ -954,23 +1084,23 @@ Shift+Enter adds a new line.'></textarea>
           <div class="status">
             <div>
               <strong id="tasks_title">No active task graph.</strong>
-              <span id="tasks_subtitle">Run a prompt to inspect tasks, steps, dependencies, and helper-agent work.</span>
+              <span id="tasks_subtitle" class="muted" style="font-size:0.84rem;">Run a prompt to see the execution plan.</span>
             </div>
             <div id="tasks_pill" class="pill neutral">Idle</div>
           </div>
           <div class="task-panel-section">
             <div class="task-panel-header">
-              <h3>Task Graph</h3>
-              <span class="task-panel-meta" id="tasks_summary">0 tasks</span>
+              <h3>Tasks</h3>
+              <span class="task-panel-meta" id="tasks_summary">—</span>
             </div>
-            <div id="tasks_block" class="task-panel-empty">No task data yet.</div>
+            <div id="tasks_block" class="task-panel-empty">Nothing yet.</div>
           </div>
           <div class="task-panel-section">
             <div class="task-panel-header">
-              <h3>Live Queue Steps</h3>
-              <span class="task-panel-meta" id="tasks_queue_summary">0 live events</span>
+              <h3>Queue Events</h3>
+              <span class="task-panel-meta" id="tasks_queue_summary">—</span>
             </div>
-            <div id="tasks_queue_block" class="task-panel-empty">No live queue activity.</div>
+            <div id="tasks_queue_block" class="task-panel-empty">Nothing yet.</div>
           </div>
         </div>
       </section>
@@ -979,55 +1109,53 @@ Shift+Enter adds a new line.'></textarea>
         <div class="status">
           <div>
             <strong id="graph_title">Checking graph status...</strong>
-            <span id="graph_subtitle">Please wait.</span>
+            <span id="graph_subtitle" class="muted" style="font-size:0.84rem;">Please wait.</span>
           </div>
           <div id="graph_pill" class="pill">...</div>
         </div>
-        <div class="actions">
+        <div class="summary-inline" id="graph_summary" style="margin: 4px 0;"></div>
+        <div class="actions" style="margin-top: 8px;">
           <button class="secondary" id="reindex_button">Rebuild Graph</button>
         </div>
-        <section class="card">
-          <h3>Graph Summary</h3>
-          <div class="summary-inline" id="graph_summary"></div>
-        </section>
-        <details>
-          <summary>More Graph Details</summary>
-          <div class="graph-grid">
-            <section class="card">
-              <h3>Connectivity</h3>
-              <dl id="graph_connectivity"></dl>
-            </section>
-            <section class="card">
-              <h3>Index</h3>
-              <dl id="graph_index"></dl>
-            </section>
-            <section class="card">
-              <h3>Live Graph</h3>
-              <dl id="graph_live"></dl>
-            </section>
-          </div>
+        <details style="margin-top: 8px;">
+          <summary>Details</summary>
+          <dl id="graph_details" style="margin-top: 8px;"></dl>
         </details>
       </section>
 
       <section class="tab-panel" id="tab_sessions">
-        <div class="actions" style="margin-top: 0;">
-          <button class="secondary" id="sessions_button">Refresh Sessions</button>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px;">
+          <span class="muted" style="font-size:0.84rem;">Click a session to load its history.</span>
+          <button class="secondary" id="sessions_button" style="width:auto; padding:6px 12px; font-size:0.84rem;">Refresh</button>
         </div>
-        <ul id="session_list"></ul>
-        <details>
-          <summary>Selected Session History</summary>
-          <pre id="history_output">[]</pre>
+        <ul id="session_list" style="list-style:none; padding:0; margin:0; display:grid; gap:6px;"></ul>
+        <details style="margin-top:12px;">
+          <summary style="font-size:0.84rem;">Raw History JSON</summary>
+          <div style="position:relative; margin-top:6px;">
+            <button class="secondary" onclick="navigator.clipboard.writeText(document.getElementById('history_output').textContent)" style="position:absolute;top:8px;right:8px;width:auto;padding:4px 10px;font-size:0.78rem;z-index:1;">Copy</button>
+            <pre id="history_output" style="max-height:320px; overflow-y:auto; padding-top:36px;">[]</pre>
+          </div>
         </details>
       </section>
 
       <section class="tab-panel" id="tab_raw">
-        <div class="card">
-          <h3>Raw Result</h3>
-          <pre id="result">{}</pre>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+          <span class="muted" style="font-size:0.84rem;">Raw JSON for last run and graph state.</span>
+          <button class="secondary" id="debug_refresh_button" style="width:auto; padding:6px 12px; font-size:0.84rem;">Refresh</button>
         </div>
-        <div class="card">
-          <h3>Raw Graph Output</h3>
-          <pre id="graph_status">{}</pre>
+        <div class="card" style="padding:10px 12px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+            <strong style="font-size:0.84rem;">Last Run</strong>
+            <button class="secondary" onclick="navigator.clipboard.writeText(document.getElementById('result').textContent)" style="width:auto; padding:3px 10px; font-size:0.78rem;">Copy</button>
+          </div>
+          <pre id="result" style="max-height:300px; overflow-y:auto; margin:0;">{}</pre>
+        </div>
+        <div class="card" style="padding:10px 12px; margin-top:10px;">
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:6px;">
+            <strong style="font-size:0.84rem;">Graph State</strong>
+            <button class="secondary" onclick="navigator.clipboard.writeText(document.getElementById('graph_status').textContent)" style="width:auto; padding:3px 10px; font-size:0.78rem;">Copy</button>
+          </div>
+          <pre id="graph_status" style="max-height:300px; overflow-y:auto; margin:0;">{}</pre>
         </div>
       </section>
     </aside>
@@ -1040,9 +1168,7 @@ Shift+Enter adds a new line.'></textarea>
     const graphSubtitleEl = document.getElementById("graph_subtitle");
     const graphPillEl = document.getElementById("graph_pill");
     const graphSummaryEl = document.getElementById("graph_summary");
-    const graphConnectivityEl = document.getElementById("graph_connectivity");
-    const graphIndexEl = document.getElementById("graph_index");
-    const graphLiveEl = document.getElementById("graph_live");
+    const graphDetailsEl = document.getElementById("graph_details");
     const tasksTitleEl = document.getElementById("tasks_title");
     const tasksSubtitleEl = document.getElementById("tasks_subtitle");
     const tasksPillEl = document.getElementById("tasks_pill");
@@ -1064,6 +1190,7 @@ Shift+Enter adds a new line.'></textarea>
     const STORAGE_KEY = "shipyard.workbench.v2";
     let uiState = loadState();
     let submitInFlight = false;
+    let showInternalHelpers = false;
 
     function loadState() {
       try {
@@ -1144,6 +1271,7 @@ Shift+Enter adds a new line.'></textarea>
       return {
         instruction: document.getElementById("instruction").value,
         session_id: document.getElementById("session_id").value,
+        workspace_select: document.getElementById("workspace_select").value,
         function_name: document.getElementById("function_name").value,
         target_path: document.getElementById("target_path").value,
         edit_mode: document.getElementById("edit_mode").value,
@@ -1160,6 +1288,7 @@ Shift+Enter adds a new line.'></textarea>
 
     function clearActivity() {
       document.getElementById("session_id").value = "";
+      document.getElementById("workspace_select").value = "";
       document.getElementById("target_path").value = "";
       document.getElementById("context_json").value = "";
       saveState({
@@ -1321,13 +1450,13 @@ Shift+Enter adds a new line.'></textarea>
       `).join("");
       const activeJobId = queueMeta(active).job_id || queueMeta(session).job_id || null;
       const activeState = queueMeta(active).state || queueMeta(session).state || null;
-      if (activeJobId && ["queued", "planning", "running", "verifying"].includes(activeState)) {
+      if (activeJobId && isLiveQueueState(activeState)) {
         queueStatusEl.innerHTML += `<div class="actions"><button id="cancel_run_button" class="secondary">Cancel Run</button></div>`;
         const button = document.getElementById("cancel_run_button");
         if (button) button.addEventListener("click", () => cancelRun(activeJobId));
       }
       renderQueueTimeline(data);
-      renderTasksPanel(uiState.lastResult || null, active || session || null);
+      renderTasksPanel(null, active || session || null);
     }
 
     function renderQueuedRun(job, instruction) {
@@ -1361,7 +1490,7 @@ Shift+Enter adds a new line.'></textarea>
           meta: [currentTask ? `Task: ${currentTask}` : null, queue.state ? `State: ${queue.state}` : null].filter(Boolean),
         },
       ]);
-      renderTasksPanel(uiState.lastResult || null, job);
+      renderTasksPanel(null, job);
     }
 
     function summarizeEventPayload(payload) {
@@ -1476,6 +1605,14 @@ Shift+Enter adds a new line.'></textarea>
       return String(value);
     }
 
+    function isTerminalStatus(status) {
+      return ["completed", "failed", "blocked", "cancelled", "not_found"].includes(String(status || ""));
+    }
+
+    function isLiveQueueState(status) {
+      return ["queued", "planning", "running", "verifying"].includes(String(status || ""));
+    }
+
     function escapeHtml(value) {
       return String(value ?? "")
         .replaceAll("&", "&amp;")
@@ -1485,11 +1622,54 @@ Shift+Enter adds a new line.'></textarea>
         .replaceAll("'", "&#39;");
     }
 
-    function renderTaskBlock(tasks, steps) {
-      const taskList = Array.isArray(tasks) ? tasks : [];
-      const stepList = Array.isArray(steps) ? steps : [];
-      if (!taskList.length && !stepList.length) return "";
-      const taskCards = taskList.map((task, index) => {
+    function isHelperTask(task) {
+      const role = String(task?.role || "");
+      return role.includes("helper");
+    }
+
+    function classifyPhase(item) {
+      const actionClass = String(item?.action_class || "").toLowerCase();
+      const role = String(item?.role || "").toLowerCase();
+      if (isHelperTask(item)) return "Internal Helpers";
+      if (actionClass === "inspect" || role.includes("inspector")) return "Inspect";
+      if (actionClass === "verify" || role.includes("verifier")) return "Verify";
+      if (role.includes("orchestrator") || role.includes("supervisor")) return "Run";
+      return "Edit";
+    }
+
+    function dedupeTasks(tasks) {
+      const merged = new Map();
+      for (const task of Array.isArray(tasks) ? tasks : []) {
+        const taskId = String(task?.task_id || "");
+        if (!taskId) continue;
+        const current = merged.get(taskId) || {};
+        const children = [...new Set([...(current.child_task_ids || []), ...(task.child_task_ids || [])])];
+        const allowedActions = [...new Set([...(current.allowed_actions || []), ...(task.allowed_actions || [])])];
+        merged.set(taskId, {
+          ...current,
+          ...task,
+          child_task_ids: children,
+          allowed_actions: allowedActions,
+          retry_count: Math.max(Number(current.retry_count || 0), Number(task.retry_count || 0)) || undefined,
+        });
+      }
+      return Array.from(merged.values());
+    }
+
+    function groupByPhase(items, classifier) {
+      const phases = new Map();
+      for (const item of items) {
+        const phase = classifier(item);
+        if (!phases.has(phase)) phases.set(phase, []);
+        phases.get(phase).push(item);
+      }
+      return phases;
+    }
+
+    function renderTaskCards(taskList, {includeHelpers = false} = {}) {
+      return taskList
+        .filter((task) => includeHelpers || !isHelperTask(task))
+        .map((task, index) => {
         const taskId = task?.task_id || `task-${index + 1}`;
         const goal = task?.goal || taskId;
         const status = task?.status || "planned";
@@ -1511,6 +1691,9 @@ Shift+Enter adds a new line.'></textarea>
         if (Array.isArray(task?.child_task_ids) && task.child_task_ids.length) {
           bits.push(`<span class="task-chip">children: ${escapeHtml(task.child_task_ids.join(", "))}</span>`);
         }
+        if (task?.retry_count) {
+          bits.push(`<span class="task-chip">retries: ${escapeHtml(task.retry_count)}</span>`);
+        }
         return `
           <div class="task-card">
             <div class="task-card-top">
@@ -1522,7 +1705,26 @@ Shift+Enter adds a new line.'></textarea>
           </div>
         `;
       }).join("");
-      const stepCards = stepList.map((step, index) => {
+    }
+
+    function renderQueueEvents(events) {
+      const eventList = Array.isArray(events) ? events.slice(-8).reverse() : [];
+      if (!eventList.length) return "";
+      return `<div class="task-block"><div class="task-block-title">Queue Activity</div><div class="task-grid">${
+        eventList.map((event, index) => `
+          <div class="task-card">
+            <div class="task-card-top">
+              <div class="task-card-id">${escapeHtml(event?.label || event?.event || `event-${index + 1}`)}</div>
+              <div class="task-card-status">${escapeHtml(String(event?.timestamp || "").split("T")[1] || "")}</div>
+            </div>
+            <div class="task-card-goal">${escapeHtml(event?.payload?.instruction || event?.payload?.status || "Queue update")}</div>
+          </div>
+        `).join("")
+      }</div></div>`;
+    }
+
+    function renderStepCards(stepList) {
+      return stepList.map((step, index) => {
         const taskId = step?.id || `step-${index + 1}`;
         const goal = step?.instruction || taskId;
         const status = step?.status || step?.edit_mode || "planned";
@@ -1536,6 +1738,12 @@ Shift+Enter adds a new line.'></textarea>
         if (Array.isArray(step?.inputs_from) && step.inputs_from.length) {
           bits.push(`<span class="task-chip">inputs: ${escapeHtml(step.inputs_from.join(", "))}</span>`);
         }
+        if (step?.retry_count) {
+          bits.push(`<span class="task-chip">retries: ${escapeHtml(step.retry_count)}</span>`);
+        }
+        if (step?.no_op) {
+          bits.push(`<span class="task-chip">no-op</span>`);
+        }
         return `
           <div class="task-card">
             <div class="task-card-top">
@@ -1547,42 +1755,78 @@ Shift+Enter adds a new line.'></textarea>
           </div>
         `;
       }).join("");
+    }
+
+    function renderPhaseSections(title, items, renderer, {includeHelpers = false} = {}) {
+      const grouped = groupByPhase(items, classifyPhase);
+      const order = ["Run", "Inspect", "Edit", "Verify", "Internal Helpers"];
+      const sections = [];
+      for (const phase of order) {
+        const phaseItems = grouped.get(phase) || [];
+        const visibleItems = includeHelpers ? phaseItems : phaseItems.filter((item) => !isHelperTask(item));
+        if (!visibleItems.length) continue;
+        const cards = renderer(visibleItems, {includeHelpers});
+        if (!cards) continue;
+        sections.push(`<div class="task-block"><div class="task-block-title">${escapeHtml(phase)}</div><div class="task-grid">${cards}</div></div>`);
+      }
+      if (!sections.length) return "";
+      return `<div class="task-block"><div class="task-block-title">${escapeHtml(title)}</div>${sections.join("")}</div>`;
+    }
+
+    function renderTaskBlock(tasks, steps) {
+      const taskList = dedupeTasks(tasks);
+      const stepList = Array.isArray(steps) ? steps : [];
+      if (!taskList.length && !stepList.length) return "";
+      const stepIds = new Set(stepList.map((step) => String(step?.id || "")).filter(Boolean));
+      const logicalTasks = taskList.filter((task) => {
+        const taskId = String(task?.task_id || "");
+        if (!taskId) return false;
+        return !stepIds.has(taskId);
+      });
+      const visibleHelperCount = taskList.filter((task) => isHelperTask(task)).length;
+      const helperToggle = visibleHelperCount
+        ? `<div class="actions" style="margin-top:0;"><button class="secondary" id="toggle_helpers_button">${showInternalHelpers ? "Hide internal helpers" : "Show internal helpers"}</button></div>`
+        : "";
+      const taskSections = renderPhaseSections("Run", logicalTasks, renderTaskCards, {includeHelpers: showInternalHelpers});
+      const stepSections = renderPhaseSections("Lifecycle Steps", stepList, renderStepCards, {includeHelpers: true});
       return `
-        ${taskCards ? `<div class="task-block"><div class="task-block-title">Tasks</div><div class="task-grid">${taskCards}</div></div>` : ""}
-        ${stepCards ? `<div class="task-block"><div class="task-block-title">Steps</div><div class="task-grid">${stepCards}</div></div>` : ""}
+        ${helperToggle}
+        ${taskSections}
+        ${stepSections}
       `;
     }
 
     function renderTasksPanel(resultData = null, queueData = null) {
-      const tasks = Array.isArray(resultData?.tasks) ? resultData.tasks : (Array.isArray(queueData?.tasks) ? queueData.tasks : []);
-      const steps = Array.isArray(resultData?.steps) ? resultData.steps : (Array.isArray(queueData?.steps) ? queueData.steps : []);
       const queue = queueData?.queue || queueData || {};
-      const liveTasks = Array.isArray(queue.task_events)
-        ? queue.task_events
-            .filter((event) => event?.payload?.instruction)
-            .map((event, index) => ({
-              task_id: `live-${index + 1}`,
-              role: event?.payload?.role || "lead-agent",
-              agent_type: "live",
-              goal: event.payload.instruction,
-              status: event.label || event.event || "pending",
-              allowed_actions: [],
-            }))
-        : [];
       const queueState = queue?.state || queueData?.status || resultData?.queue?.state || resultData?.status || "idle";
+      const preferQueue = isLiveQueueState(queueState);
+      const tasks = preferQueue
+        ? (Array.isArray(queueData?.tasks) ? queueData.tasks : [])
+        : (Array.isArray(resultData?.tasks) ? resultData.tasks : (Array.isArray(queueData?.tasks) ? queueData.tasks : []));
+      const steps = preferQueue
+        ? (Array.isArray(queueData?.steps) ? queueData.steps : [])
+        : (Array.isArray(resultData?.steps) ? resultData.steps : (Array.isArray(queueData?.steps) ? queueData.steps : []));
+      const queueEvents = Array.isArray(queue.task_events) ? queue.task_events : [];
       const activeCount = tasks.length || steps.length;
       tasksTitleEl.textContent = activeCount ? "Task graph loaded." : "No active task graph.";
       tasksSubtitleEl.textContent = activeCount
-        ? "Inspect lead and helper tasks, dependencies, and current execution state."
-        : "Run a prompt to inspect tasks, steps, dependencies, and helper-agent work.";
+        ? "Inspect the canonical run lifecycle, logical steps, and internal helpers only when needed."
+        : "Run a prompt to inspect lifecycle steps, dependencies, recovery, and internal helper work.";
       tasksPillEl.textContent = textOrDash(queueState);
       tasksPillEl.className = `pill ${["completed", "verified", "edited", "observed"].includes(queueState) ? "good" : (["failed", "blocked", "cancelled"].includes(queueState) ? "bad" : "neutral")}`;
-      tasksSummaryEl.textContent = `${tasks.length} task${tasks.length === 1 ? "" : "s"} · ${steps.length} step${steps.length === 1 ? "" : "s"}`;
-      tasksQueueSummaryEl.textContent = `${liveTasks.length} live event${liveTasks.length === 1 ? "" : "s"}`;
+      tasksSummaryEl.textContent = tasks.length || steps.length ? `${tasks.length} task${tasks.length === 1 ? "" : "s"} · ${steps.length} step${steps.length === 1 ? "" : "s"}` : "—";
+      tasksQueueSummaryEl.textContent = queueEvents.length ? `${queueEvents.length} event${queueEvents.length === 1 ? "" : "s"}` : "—";
       const taskMarkup = renderTaskBlock(tasks, steps);
       tasksBlockEl.className = taskMarkup ? "" : "task-panel-empty";
       tasksBlockEl.innerHTML = taskMarkup || "No task data yet.";
-      const queueMarkup = renderTaskBlock(liveTasks, []);
+      const toggleButton = document.getElementById("toggle_helpers_button");
+      if (toggleButton) {
+        toggleButton.addEventListener("click", () => {
+          showInternalHelpers = !showInternalHelpers;
+          renderTasksPanel(resultData, queueData);
+        });
+      }
+      const queueMarkup = renderQueueEvents(queueEvents);
       tasksQueueBlockEl.className = queueMarkup ? "" : "task-panel-empty";
       tasksQueueBlockEl.innerHTML = queueMarkup || "No live queue activity.";
     }
@@ -1641,12 +1885,11 @@ Shift+Enter adds a new line.'></textarea>
     function renderGraphDetails(data) {
       const indexFiles = data?.index_state?.files || [];
       const nextStep = data?.ready
-        ? (data?.index_state?.stale ? "Sync again after more edits if you need graph-aware function work." : "No action needed.")
+        ? (data?.index_state?.stale ? "Sync after more edits." : "No action needed.")
         : (!data?.index_state?.has_index || !data?.live_graph_state?.populated ? "Sync the live graph." : "Review graph status.");
       graphSummaryEl.innerHTML = [
         ["State", data?.ready ? "Ready" : "Needs attention"],
         ["Counts", `${textOrDash(data?.live_graph_state?.node_count)} nodes / ${textOrDash(data?.live_graph_state?.relationship_count)} rel`],
-        ["Stale", yesNo(data?.index_state?.stale)],
         ["Next", nextStep],
       ].map(([label, value]) => `
         <div class="summary-chip">
@@ -1655,29 +1898,32 @@ Shift+Enter adds a new line.'></textarea>
         </div>
       `).join("");
 
-      renderDefinitionList(graphConnectivityEl, [
+      renderDefinitionList(graphDetailsEl, [
         ["Available", yesNo(data?.available)],
-        ["Reason", textOrDash(data?.reason)]
-      ]);
-
-      renderDefinitionList(graphIndexEl, [
-        ["Has Index File", yesNo(data?.index_state?.has_index)],
+        ["Reason", textOrDash(data?.reason)],
+        ["Has Index", yesNo(data?.index_state?.has_index)],
         ["Stale", yesNo(data?.index_state?.stale)],
-        ["Files", indexFiles.length ? `<ul class="graph-files">${indexFiles.map((file) => `<li>${file}</li>`).join("")}</ul>` : "—"]
-      ]);
-
-      renderDefinitionList(graphLiveEl, [
         ["Populated", yesNo(data?.live_graph_state?.populated)],
-        ["Node Count", textOrDash(data?.live_graph_state?.node_count)],
-        ["Relationship Count", textOrDash(data?.live_graph_state?.relationship_count)]
+        ["Nodes", textOrDash(data?.live_graph_state?.node_count)],
+        ["Relationships", textOrDash(data?.live_graph_state?.relationship_count)],
+        ["Files", indexFiles.length ? indexFiles.join(", ") : "—"],
       ]);
     }
 
     function summarizeResult(data) {
       const status = data?.status || "unknown";
       const error = data?.error;
+      const noOp = Boolean(data?.execution?.no_op ?? data?.no_op);
       if (error) {
         return {title: `Run finished with ${status}.`, subtitle: error, pill: status, tone: "bad"};
+      }
+      if (noOp && (status === "edited" || status === "observed" || status === "no_op")) {
+        return {
+          title: "Run finished without changing files.",
+          subtitle: "The latest instruction completed, but it did not apply a material file change.",
+          pill: "no_op",
+          tone: "neutral"
+        };
       }
       if (status === "verified" || status === "edited") {
         return {
@@ -1711,7 +1957,7 @@ Shift+Enter adds a new line.'></textarea>
     function summarizeToolOutput(toolOutput) {
       if (!toolOutput || typeof toolOutput !== "object") return [];
       const tool = toolOutput.tool;
-      if (tool === "run_command") {
+      if (tool === "run_command" || tool === "verify_command" || tool === "run_tests") {
         const lines = [
           toolOutput.command ? `Command: ${toolOutput.command}` : null,
           Number.isInteger(toolOutput.returncode) ? `Exit: ${toolOutput.returncode}` : null,
@@ -1753,12 +1999,41 @@ Shift+Enter adds a new line.'></textarea>
       const preview = data?.execution?.file_preview || data?.file_preview;
       const contentHash = data?.execution?.content_hash || data?.content_hash;
       const toolOutput = data?.execution?.tool_output || data?.tool_output;
+      const verificationResults = data?.execution?.verification_results || data?.verification_results || [];
+      const verificationRetryCount = data?.execution?.verification_retry_count ?? data?.verification_retry_count;
+      const revertedFiles = data?.execution?.reverted_files || data?.reverted_files || [];
+      const revertCount = data?.execution?.revert_count ?? data?.revert_count;
       const taskBlockHtml = renderTaskBlock(data?.tasks || [], data?.steps || []);
       const previewSuffix = data?.execution?.file_preview_truncated || data?.file_preview_truncated ? "..." : "";
       const changedSummary = changedFiles.length
         ? (changedFiles.length === 1 ? `Changed: ${changedFiles[0]}` : `Changed ${changedFiles.length} files`)
         : null;
       const toolSummary = summarizeToolOutput(toolOutput);
+      const verificationSummary = [];
+      const verifyBlockHtml = (() => {
+        if (!Array.isArray(verificationResults) || !verificationResults.length) return "";
+        const allPassed = verificationResults.every((r) => r?.returncode === 0);
+        const lines = verificationResults.flatMap((result) => {
+          if (!result || typeof result !== "object") return [];
+          const out = [];
+          if (result.command) out.push(`$ ${result.command}`);
+          if (result.stdout) out.push(String(result.stdout).trim().slice(0, 300));
+          if (result.stderr) out.push(String(result.stderr).trim().slice(0, 300));
+          if (Number.isInteger(result.returncode)) out.push(`exit ${result.returncode}`);
+          return out;
+        });
+        if (Number.isInteger(verificationRetryCount) && verificationRetryCount > 0) {
+          lines.push(`Retries: ${verificationRetryCount}`);
+        }
+        if (revertedFiles.length) {
+          lines.push(revertedFiles.length === 1 ? `Reverted: ${revertedFiles[0]}` : `Reverted: ${revertedFiles.length} files`);
+        } else if (Number.isInteger(revertCount) && revertCount > 0) {
+          lines.push(`Reverted: ${revertCount} files`);
+        }
+        const tone = allPassed ? "pass" : "fail";
+        const label = allPassed ? "Verification passed" : "Verification failed";
+        return `<div class="verify-block ${tone}"><div class="verify-block-label">${label}</div>${lines.map((l) => `<div class="verify-line">${escapeHtml(l)}</div>`).join("")}</div>`;
+      })();
       const sessionId = getActiveSessionId(data) || "session";
       const resultKey = uiState.activeJobId || uiState.lastCompletedJobId || data?.job_id || data?.trace_path || data?.content_hash || `${sessionId}-${resultValue(data, ["execution", "status"], data?.status)}`;
       const runKeys = [uiState.activeJobId, uiState.lastCompletedJobId, data?.job_id, data?.session_id, sessionId, data?.trace_path];
@@ -1784,6 +2059,21 @@ Shift+Enter adds a new line.'></textarea>
         [uiState.activeJobId, uiState.lastCompletedJobId, data?.job_id, data?.trace_path, data?.session_id, sessionId],
         renderedInstruction,
       );
+      const gateBlockHtml = (() => {
+        if (!humanGate?.prompt) return "";
+        const action = humanGate?.action || "";
+        const isWideImpact = action === "approve_wide_impact";
+        const detailCount = humanGate?.details?.count;
+        const detailText = detailCount ? ` (${detailCount} files affected)` : "";
+        const approveBtn = isWideImpact
+          ? `<button class="gate-approve-btn" onclick="approveWideImpact()">Approve${detailText}</button>`
+          : "";
+        return `<div class="gate-block"><div class="gate-block-label">Action required · ${escapeHtml(action)}</div><div class="gate-block-text">${escapeHtml(humanGate.prompt)}</div>${approveBtn}</div>`;
+      })();
+      if (humanGate?.action === "approve_wide_impact") {
+        _pendingApproveInstruction = renderedInstruction;
+      }
+      const detailsHtml = [taskBlockHtml, verifyBlockHtml, gateBlockHtml].filter(Boolean).join("") || undefined;
       appendActivityMessages([
         {
           id: userMessageId,
@@ -1796,18 +2086,18 @@ Shift+Enter adds a new line.'></textarea>
           id: assistantMessageId,
           role: "assistant",
           label: "Shipyard",
-          text: data?.status === "idle" ? "Write an instruction and Shipyard will handle it here." : (humanGate?.prompt || summary.subtitle),
-          detailsHtml: taskBlockHtml,
+          text: data?.status === "idle" ? "Write an instruction and Shipyard will handle it here." : summary.subtitle,
+          detailsHtml,
           badge: summary.pill,
-          badgeTone: humanGate?.prompt ? "bad" : summary.tone,
-        meta: [
-          targetPath !== "—" ? `Target: ${targetPath}` : null,
-          changedSummary,
-          preview ? `Preview: ${preview}${previewSuffix}` : null,
-          ...toolSummary,
-          nextStep !== "—" && nextStep !== "clarify_request" ? `Next: ${nextStep}` : null,
-          contentHash ? `Hash: ${contentHash}` : null,
-        ].filter((line) => typeof line === "string"),
+          badgeTone: summary.tone,
+          meta: [
+            targetPath !== "—" ? `Target: ${targetPath}` : null,
+            changedSummary,
+            preview ? `Preview: ${preview}${previewSuffix}` : null,
+            ...toolSummary,
+            ...verificationSummary,
+            contentHash ? `Hash: ${contentHash}` : null,
+          ].filter((line) => typeof line === "string"),
         },
       ]);
     }
@@ -1887,6 +2177,31 @@ Shift+Enter adds a new line.'></textarea>
       return JSON.parse(raw);
     }
 
+    function syncWorkspaceContext(workspacePath) {
+      const context = parseContext();
+      if (workspacePath) {
+        context.workspace_path = workspacePath;
+      } else {
+        delete context.workspace_path;
+      }
+      if (!document.getElementById("target_path").value.trim() && context.file_hint) {
+        delete context.file_hint;
+      }
+      document.getElementById("context_json").value = Object.keys(context).length ? pretty(context) : "";
+      return context;
+    }
+
+    function renderWorkspaceFolders(items, selectedPath) {
+      const selectEl = document.getElementById("workspace_select");
+      const options = [{path: "", label: "Managed workspace (.shipyard/data/workspace/default)"}].concat(Array.isArray(items) ? items : []);
+      selectEl.innerHTML = options.map((item) => {
+        const value = escapeHtml(item.path || "");
+        const label = escapeHtml(item.label || item.path || "");
+        const selected = (item.path || "") === (selectedPath || "") ? " selected" : "";
+        return `<option value="${value}"${selected}>${label}</option>`;
+      }).join("");
+    }
+
     function verificationCommands() {
       return document.getElementById("verification_commands").value
         .split("\\n")
@@ -1910,10 +2225,14 @@ Shift+Enter adds a new line.'></textarea>
       if (!sessionId) return false;
       try {
         const data = await fetchJson(`/sessions/${sessionId}`);
+        const workspacePath = data?.request?.context?.workspace_path || "";
+        document.getElementById("workspace_select").value = workspacePath;
+        syncWorkspaceContext(workspacePath || null);
         renderResultDetails(data);
         resultEl.textContent = pretty(data);
         saveState({lastResult: data, activeSessionId: sessionId});
         renderTasksPanel(data, data?.queue || null);
+        loadWorkspaceStatus(sessionId);
         if (!quiet) {
           await loadHistory(sessionId);
         }
@@ -1934,7 +2253,7 @@ Shift+Enter adds a new line.'></textarea>
             if (terminal) {
               saveState({pending: null, pendingInstruction: null});
               stopSessionPolling();
-              Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
+              Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(sessionId), loadSessions()]);
               return;
             }
           }
@@ -1942,18 +2261,18 @@ Shift+Enter adds a new line.'></textarea>
           if (recovered && uiState.pending) {
             saveState({pending: null, pendingInstruction: null});
             stopSessionPolling();
-            Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
+            Promise.allSettled([loadGraphStatus(), loadWorkspaceStatus(sessionId), loadSessions()]);
             return;
           }
-          if (
-            queueData?.session &&
-            ["completed", "failed"].includes(queueData.session.status) &&
-            !uiState.activeJobId
-          ) {
+          if (queueData?.session && isTerminalStatus(queueData.session.status) && !uiState.activeJobId) {
             saveState({pending: null, pendingInstruction: null});
             stopSessionPolling();
             clearTransientRunMessages();
-            Promise.allSettled([hydrateSessionState(sessionId, {quiet: true}), loadGraphStatus(), loadWorkspaceStatus(), loadSessions()]);
+            renderResultDetails(queueData.session);
+            resultEl.textContent = pretty(queueData.session);
+            renderTasksPanel(queueData.session, queueData.session?.queue || null);
+            saveState({lastResult: queueData.session, activeSessionId: sessionId});
+            Promise.allSettled([loadHistory(sessionId), loadGraphStatus(), loadWorkspaceStatus(sessionId), loadSessions()]);
             return;
           }
           if (uiState.pending && queueData?.session) {
@@ -1986,9 +2305,14 @@ Shift+Enter adds a new line.'></textarea>
     async function hydrateActiveRun(jobId, sessionId = null) {
       if (!jobId) return false;
       const job = await loadQueueJob(jobId);
-      if (!job) return false;
+      if (!job) {
+        // Job vanished (404) — clear active state and stop polling
+        saveState({ activeJobId: null, pending: null, pendingInstruction: null });
+        stopSessionPolling();
+        return true;
+      }
 
-      const terminal = job.status === "completed" || job.status === "failed";
+      const terminal = isTerminalStatus(job.status);
       if (terminal) {
         const resolvedJobId = job?.queue?.job_id || job?.job_id || null;
         const resolvedSessionId = sessionId || job.session_id || uiState.activeSessionId || null;
@@ -2002,14 +2326,13 @@ Shift+Enter adds a new line.'></textarea>
         });
         renderResultDetails(job);
         resultEl.textContent = pretty(job);
-        if (resolvedSessionId) {
-          hydrateSessionState(resolvedSessionId, {quiet: true});
-        }
+        renderTasksPanel(job, job?.queue || null);
+        if (resolvedSessionId) loadHistory(resolvedSessionId);
         return true;
       }
 
       renderQueuedRun(job, uiState.pendingInstruction || uiState.form?.instruction || "");
-      renderTasksPanel(uiState.lastResult || null, job);
+      renderTasksPanel(null, job);
 
       saveState({
         activeJobId: job?.queue?.job_id || job?.job_id,
@@ -2122,63 +2445,108 @@ Shift+Enter adds a new line.'></textarea>
       sessionListEl.innerHTML = "";
       for (const session of data.sessions) {
         const item = document.createElement("li");
-        const button = document.createElement("button");
-        button.textContent = `${session.session_id} · ${session.status} · ${session.edit_mode || "auto"}`;
-        button.addEventListener("click", () => {
+        const shortId = session.session_id.length > 16 ? "…" + session.session_id.slice(-12) : session.session_id;
+        const excerpt = session.instruction ? session.instruction.slice(0, 60) + (session.instruction.length > 60 ? "…" : "") : shortId;
+        const tone = ["edited", "verified", "observed"].includes(session.status) ? "good" : (["failed", "blocked"].includes(session.status) ? "bad" : "neutral");
+        item.innerHTML = `
+          <button class="session-item" data-sid="${session.session_id}">
+            <span class="session-excerpt">${excerpt}</span>
+            <span class="pill ${tone}" style="font-size:0.74rem; padding:2px 8px; flex-shrink:0;">${session.status || "—"}</span>
+          </button>`;
+        item.querySelector("button").addEventListener("click", () => {
           openPanel("sessions");
           loadHistory(session.session_id);
         });
-        item.appendChild(button);
         sessionListEl.appendChild(item);
       }
       if (!data.sessions.length) {
         const empty = document.createElement("li");
+        empty.className = "muted";
+        empty.style.fontSize = "0.84rem";
+        empty.style.padding = "8px 2px";
         empty.textContent = "No sessions yet.";
         sessionListEl.appendChild(empty);
       }
     }
 
-    async function loadWorkspaceStatus() {
-      const data = await fetchJson("/workspace/status");
-      workspaceHintEl.textContent = "Testing mode writes to Shipyard's managed workspace by default.";
-      workspaceDetailsEl.textContent = "Testing mode writes to Shipyard's managed workspace by default. Use an override path only when you need one.";
+    async function loadWorkspaceStatus(sessionId = null) {
+      const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+      const data = await fetchJson(`/workspace/status${query}`);
+      const selection = data?.selection || {};
+      const label = selection?.workspace_label || "default";
+      if (selection?.mode === "repo_folder") {
+        workspaceHintEl.textContent = `Testing mode is attached to repo folder ${label}.`;
+        workspaceDetailsEl.textContent = `This session is writing into repo folder ${label}. Relative targets resolve inside that folder.`;
+      } else {
+        workspaceHintEl.textContent = "Testing mode is attached to the managed workspace until you pick a repo folder.";
+        workspaceDetailsEl.textContent = "This session is using Shipyard's managed workspace. Pick a repo folder if you want edits attached to a real directory in this repo.";
+      }
+      renderWorkspaceFolders(data?.folders || [], selection?.workspace_path || "");
       saveState({workspaceStatus: data});
     }
 
     async function createWorkspace() {
       try {
         const sessionId = uiState.activeSessionId || ensureSessionId();
-        const data = await fetchJson("/workspace/temp", {
+        const data = await fetchJson("/workspace/select", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({session_id: sessionId})
+          body: JSON.stringify({session_id: sessionId, workspace_path: null})
         });
-        const target = `${data.path}/file.py`;
-        document.getElementById("target_path").value = target;
         document.getElementById("session_id").value = sessionId;
-        const context = parseContext();
-        context.file_hint = target;
-        document.getElementById("context_json").value = pretty(context);
+        document.getElementById("workspace_select").value = "";
+        syncWorkspaceContext(null);
         renderResultDetails({
           status: "workspace_ready",
-          target_path: target,
+          workspace: data,
           proposal_summary: {target_path_source: "workspace_button"}
         });
         resultEl.textContent = pretty({
-          workspace_created: data.path,
-          suggested_target_path: target
+          workspace_selected: data
         });
         saveState({
           lastResult: {
             status: "workspace_ready",
-            target_path: target,
+            workspace: data,
             proposal_summary: {target_path_source: "workspace_button"},
-            workspace_created: data.path,
           },
           activeSessionId: sessionId,
           form: currentFormState(),
         });
-        await loadWorkspaceStatus();
+        await loadWorkspaceStatus(sessionId);
+        openPanel("details");
+      } catch (error) {
+        resultEl.textContent = pretty({error: String(error)});
+      }
+    }
+
+    async function selectWorkspaceFolder() {
+      try {
+        const sessionId = uiState.activeSessionId || ensureSessionId();
+        const selectedPath = document.getElementById("workspace_select").value || null;
+        const data = await fetchJson("/workspace/select", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({session_id: sessionId, workspace_path: selectedPath})
+        });
+        document.getElementById("session_id").value = sessionId;
+        syncWorkspaceContext(data?.workspace_path || null);
+        renderResultDetails({
+          status: "workspace_ready",
+          workspace: data,
+          proposal_summary: {target_path_source: "workspace_select"}
+        });
+        resultEl.textContent = pretty({workspace_selected: data});
+        saveState({
+          lastResult: {
+            status: "workspace_ready",
+            workspace: data,
+            proposal_summary: {target_path_source: "workspace_select"},
+          },
+          activeSessionId: sessionId,
+          form: currentFormState(),
+        });
+        await loadWorkspaceStatus(sessionId);
         openPanel("details");
       } catch (error) {
         resultEl.textContent = pretty({error: String(error)});
@@ -2220,6 +2588,12 @@ Shift+Enter adds a new line.'></textarea>
           sessionId = generateSessionId();
           sessionField.value = sessionId;
         }
+        const selectedWorkspace = document.getElementById("workspace_select").value.trim();
+        if (selectedWorkspace) {
+          context.workspace_path = selectedWorkspace;
+        } else {
+          delete context.workspace_path;
+        }
         if (!targetPath && context.file_hint) {
           delete context.file_hint;
         }
@@ -2233,7 +2607,8 @@ Shift+Enter adds a new line.'></textarea>
           edit_mode: document.getElementById("edit_mode").value || null,
           proposal_mode: document.getElementById("proposal_mode").value || null,
           context,
-          verification_commands: verificationCommands()
+          verification_commands: verificationCommands(),
+          wide_impact_approved: false,
         };
 
         saveState({
@@ -2319,7 +2694,7 @@ Shift+Enter adds a new line.'></textarea>
             current_task: data?.current_task || "Waiting",
           };
           renderQueuedRun(queueJob, payload.instruction);
-          renderTasksPanel(uiState.lastResult || null, queueJob);
+          renderTasksPanel(null, queueJob);
         } else {
           renderResultDetails(data);
         }
@@ -2362,12 +2737,21 @@ Shift+Enter adds a new line.'></textarea>
     }
 
     document.getElementById("workspace_button").addEventListener("click", createWorkspace);
+    document.getElementById("workspace_select_button").addEventListener("click", selectWorkspaceFolder);
+    document.getElementById("workspace_refresh_button").addEventListener("click", () => {
+      loadWorkspaceStatus(getActiveSessionId(uiState.lastResult));
+    });
     document.getElementById("clear_button").addEventListener("click", clearActivity);
     document.getElementById("reindex_button").addEventListener("click", syncGraph);
     document.getElementById("cleanup_button").addEventListener("click", cleanRuntime);
     document.getElementById("sessions_button").addEventListener("click", () => {
       openPanel("sessions");
       loadSessions();
+    });
+    document.getElementById("debug_refresh_button").addEventListener("click", () => {
+      loadGraphStatus();
+      const sid = getActiveSessionId();
+      if (sid) hydrateSessionState(sid, {quiet: true});
     });
     document.getElementById("panel_toggle").addEventListener("click", () => openPanel("details"));
     document.getElementById("panel_close").addEventListener("click", () => window.scrollTo({top: 0, behavior: "smooth"}));
@@ -2401,18 +2785,83 @@ Shift+Enter adds a new line.'></textarea>
     if (uiState.activeTab) {
       selectTab(uiState.activeTab);
     }
+    async function loadGitBadge() {
+      const badgeEl = document.getElementById("git_badge");
+      if (!badgeEl) return;
+      try {
+        const data = await fetchJson("/git/status");
+        const branch = data?.branch || "";
+        if (!branch) { badgeEl.style.display = "none"; return; }
+        const isClean = data?.is_clean !== false;
+        const changedCount = Array.isArray(data?.status_lines) ? data.status_lines.length : 0;
+        badgeEl.textContent = isClean ? `⎇ ${branch}` : `⎇ ${branch} · ${changedCount} changed`;
+        badgeEl.className = `git-badge ${isClean ? "clean" : "dirty"}`;
+        badgeEl.style.display = "";
+      } catch {
+        badgeEl.style.display = "none";
+      }
+    }
+
+    let _pendingApproveInstruction = null;
+
+    async function approveWideImpact() {
+      const instruction = _pendingApproveInstruction || uiState.form?.instruction || "";
+      if (!instruction) return;
+      const context = parseContext();
+      context.testing_mode = true;
+      const sessionId = document.getElementById("session_id").value.trim() || uiState.activeSessionId || generateSessionId();
+      document.getElementById("session_id").value = sessionId;
+      const payload = {
+        session_id: sessionId,
+        instruction,
+        target_path: document.getElementById("target_path").value.trim() || null,
+        edit_mode: document.getElementById("edit_mode").value || null,
+        proposal_mode: document.getElementById("proposal_mode").value || null,
+        context,
+        verification_commands: verificationCommands(),
+        wide_impact_approved: true,
+      };
+      _pendingApproveInstruction = null;
+      saveState({
+        pending: {kind: "queued", title: "Run queued (approved)...", subtitle: "Wide-impact operation approved."},
+        form: currentFormState(),
+        activeSessionId: sessionId,
+        pendingInstruction: payload.instruction,
+      });
+      try {
+        const data = await fetchJson("/queue/instruct", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload),
+        });
+        const resolvedSessionId = data?.session_id || sessionId;
+        const jobId = data?.job_id || data?.queue_job?.job_id || null;
+        saveState({lastResult: data, activeSessionId: resolvedSessionId, activeJobId: jobId, lastCompletedJobId: null});
+        resultEl.textContent = pretty(data);
+        if (jobId) {
+          startSessionPolling(resolvedSessionId);
+          await loadQueueStatus(resolvedSessionId);
+        }
+      } catch (error) {
+        renderResultDetails({status: "error", error: String(error)});
+        saveState({pending: null});
+        stopSessionPolling();
+      }
+    }
+
     async function initializeWorkbench() {
       loadPlannerStatus();
-      loadWorkspaceStatus();
       loadGraphStatus();
       loadSessions();
+      loadGitBadge();
       const restoredSessionId = uiState.activeSessionId || getActiveSessionId(uiState.lastResult);
+      loadWorkspaceStatus(restoredSessionId);
       const restoredJobId = uiState.activeJobId || null;
       const queueData = await loadQueueStatus(restoredSessionId);
       const hasLiveQueuedOrRunning = Boolean(
-        queueData?.active ||
-        ((queueData?.queued || []).length) ||
-        (queueData?.session && ["queued", "running"].includes(queueData.session.status))
+        (queueData?.active && isLiveQueueState(queueData.active?.queue?.state || queueData.active?.status)) ||
+        ((queueData?.queued || []).some((job) => isLiveQueueState(job?.queue?.state || job?.status))) ||
+        (queueData?.session && isLiveQueueState(queueData.session.status))
       );
       if (restoredJobId && !hasLiveQueuedOrRunning) {
         saveState({
@@ -2524,7 +2973,8 @@ def queue_status(session_id: str | None = None) -> dict[str, Any]:
 def queue_job(job_id: str) -> dict[str, Any]:
     job = run_queue.get_job(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="Queued job not found.")
+        # Return a terminal status instead of 404 so the frontend stops polling
+        return {"job_id": job_id, "status": "not_found", "error": "Job expired or never existed."}
     return job
 
 
@@ -2547,13 +2997,34 @@ def planner_status() -> dict[str, Any]:
 
 
 @app.get("/workspace/status")
-def workspace_status() -> dict[str, str | bool]:
-    return get_workspace_status()
+def workspace_status(session_id: str | None = None) -> dict[str, Any]:
+    return {
+        **get_workspace_status(),
+        "selection": get_session_workspace_selection(session_id),
+        "folders": list_repo_workspace_folders(),
+    }
+
+
+@app.get("/workspace/folders")
+def workspace_folders() -> dict[str, Any]:
+    return {"folders": list_repo_workspace_folders()}
+
+
+@app.post("/workspace/select")
+def workspace_select(request: WorkspaceSelectRequest) -> dict[str, Any]:
+    if request.workspace_path:
+        normalized = normalize_repo_workspace_path(request.workspace_path)
+        if normalized is None:
+            raise HTTPException(status_code=400, detail="Workspace path must be an existing folder inside the current repo.")
+    selection = set_session_workspace(request.session_id, request.workspace_path)
+    return selection
 
 
 @app.post("/workspace/temp")
 def workspace_temp(request: WorkspaceCreateRequest) -> dict[str, str]:
-    workspace = get_session_workspace(request.session_id)
+    workspace = get_managed_workspace()
+    if request.session_id:
+        set_session_workspace(request.session_id, None)
     return {"path": str(workspace.resolve())}
 
 

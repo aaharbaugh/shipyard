@@ -299,7 +299,26 @@ def _merge_tasks(existing: list[dict[str, Any]], incoming: Any) -> list[dict[str
         if not task_id:
             continue
         if task_id in index_by_id:
-            merged[index_by_id[task_id]] = {**merged[index_by_id[task_id]], **task}
+            current = dict(merged[index_by_id[task_id]])
+            retry_count = max(
+                int(current.get("retry_count") or 0),
+                int(task.get("retry_count") or 0),
+            )
+            children = list(current.get("child_task_ids", []) or [])
+            for child in list(task.get("child_task_ids", []) or []):
+                if child not in children:
+                    children.append(child)
+            allowed_actions = list(current.get("allowed_actions", []) or [])
+            for action in list(task.get("allowed_actions", []) or []):
+                if action not in allowed_actions:
+                    allowed_actions.append(action)
+            merged[index_by_id[task_id]] = {
+                **current,
+                **task,
+                "retry_count": retry_count or None,
+                "child_task_ids": children,
+                "allowed_actions": allowed_actions,
+            }
         else:
             index_by_id[task_id] = len(merged)
             merged.append(dict(task))
@@ -319,9 +338,15 @@ def _update_job_tasks(
         tasks[root_index]["status"] = EVENT_TO_STATUS.get(event, tasks[root_index].get("status", "queued"))
 
     if event not in {"lead_agent", "verifying", "step_retry"}:
+        if event == "completed" and root_index is not None:
+            tasks[root_index]["status"] = payload.get("status") or tasks[root_index].get("status")
         return tasks
 
     step_id = str(payload.get("step_id") or f"step-{payload.get('step_index') or len(tasks)}")
+    existing_step = next((task for task in tasks if task.get("task_id") == step_id), {})
+    retry_count = int(existing_step.get("retry_count") or 0)
+    if event == "step_retry":
+        retry_count += 1
     step_task = {
         "task_id": step_id,
         "role": payload.get("role") or "lead-agent",
@@ -330,6 +355,7 @@ def _update_job_tasks(
         "goal": payload.get("instruction"),
         "allowed_actions": list(payload.get("allowed_actions", []) or []),
         "status": EVENT_TO_STATUS.get(event, "running"),
+        "retry_count": retry_count or None,
         "artifacts": {
             "step_index": payload.get("step_index"),
             "step_count": payload.get("step_count"),

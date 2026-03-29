@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from shipyard.main import (
     _plan_actions_with_cancellation,
+    _sanitize_runtime_result,
     _maybe_sync_graph,
     _run_action_plan,
     _sanitize_stale_target_request,
@@ -168,6 +169,25 @@ class MainInputTests(unittest.TestCase):
         self.assertEqual(result["changed_files"], [str(other.resolve())])
         self.assertEqual(result["file_preview"], "hello world")
 
+    def test_sanitize_runtime_result_strips_runtime_callables(self) -> None:
+        result = _sanitize_runtime_result(
+            {
+                "session_id": "demo",
+                "instruction": "make a todo app",
+                "cancel_check": lambda: False,
+                "context": {"testing_mode": True},
+                "tasks": [
+                    {
+                        "task_id": "run-demo",
+                        "callback": lambda: True,
+                    }
+                ],
+            }
+        )
+
+        self.assertNotIn("cancel_check", result)
+        self.assertEqual(result["tasks"], [{"task_id": "run-demo"}])
+
     def test_run_action_plan_executes_each_step_and_merges_changed_files(self) -> None:
         app = Mock()
         app.invoke.side_effect = [
@@ -300,21 +320,179 @@ class MainInputTests(unittest.TestCase):
             {"status": "edit_blocked", "error": "Anchor was not found in the target file.", "no_op": True, "target_path": "/tmp/main.py"},
         ]
 
-        result = _run_action_plan(
-            app,
-            {"session_id": "demo", "instruction": "inspect edit verify", "request_instruction": "inspect edit verify"},
-            {
-                "actions": [
-                    {"id": "step-1", "instruction": "Read main.py", "edit_mode": "read_file"},
-                    {"id": "step-2", "instruction": "Edit main.py", "edit_mode": "anchor"},
-                    {"id": "step-3", "instruction": "Run main.py", "edit_mode": "run_command"},
-                ]
-            },
-        )
+        # Patch replan to return None so the hard-stop path is tested in isolation.
+        with patch("shipyard.main.replan_remaining_actions", return_value=None):
+            result = _run_action_plan(
+                app,
+                {"session_id": "demo", "instruction": "inspect edit verify", "request_instruction": "inspect edit verify"},
+                {
+                    "actions": [
+                        {"id": "step-1", "instruction": "Read main.py", "edit_mode": "read_file"},
+                        {"id": "step-2", "instruction": "Edit main.py", "edit_mode": "anchor"},
+                        {"id": "step-3", "instruction": "Run main.py", "edit_mode": "run_command"},
+                    ]
+                },
+            )
 
         self.assertEqual(result["action_steps"][0]["status"], "observed")
         self.assertEqual(result["action_steps"][1]["status"], "edit_blocked")
         self.assertEqual(result["action_steps"][2]["status"], "skipped")
+
+    def test_run_action_plan_marks_no_op_edit_as_edit_skipped(self) -> None:
+        app = Mock()
+        app.invoke.return_value = {"status": "edited", "no_op": True, "target_path": "/tmp/main.py"}
+
+        result = _run_action_plan(
+            app,
+            {"session_id": "demo", "instruction": "touch main.py", "request_instruction": "touch main.py"},
+            {"actions": [{"id": "step-1", "instruction": "Touch main.py", "edit_mode": "anchor", "action_class": "mutate"}]},
+        )
+
+        self.assertEqual(result["action_steps"][0]["status"], "edit_skipped")
+
+    def test_run_action_plan_does_not_blind_retry_verification_failures(self) -> None:
+        app = Mock()
+        app.invoke.return_value = {
+            "status": "verification_failed",
+            "no_op": True,
+            "verification_results": [{"command": "python3 main.py", "returncode": 1, "stderr": "AssertionError"}],
+            "error": "Command failed with exit code 1.",
+        }
+
+        result = _run_action_plan(
+            app,
+            {"session_id": "demo", "instruction": "verify app", "request_instruction": "verify app"},
+            {"actions": [{"id": "step-1", "instruction": "Verify app", "edit_mode": "verify_command", "action_class": "verify", "max_retries": 2}]},
+        )
+
+        self.assertEqual(app.invoke.call_count, 1)
+        self.assertEqual(result["action_steps"][0]["retry_count"], 0)
+        self.assertEqual(result["action_steps"][0]["status"], "verification_failed")
+
+
+class ParallelBatchTests(unittest.TestCase):
+    """Tests for parallel batch execution of independent actions."""
+
+    def test_find_parallel_batch_groups_independent_actions(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s1", "action_class": "mutate", "edit_mode": "write_file", "target_path": "a.py"},
+            {"id": "s2", "action_class": "mutate", "edit_mode": "write_file", "target_path": "b.py"},
+            {"id": "s3", "action_class": "mutate", "edit_mode": "write_file", "target_path": "c.py"},
+        ]
+        batch = _find_parallel_batch(actions, 0, set())
+        self.assertEqual(batch, [0, 1, 2])
+
+    def test_find_parallel_batch_stops_at_dependency(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s1", "action_class": "inspect", "edit_mode": "read_file", "target_path": "a.py"},
+            {"id": "s2", "action_class": "inspect", "edit_mode": "read_file", "target_path": "b.py", "depends_on": ["s1"]},
+        ]
+        batch = _find_parallel_batch(actions, 0, set())
+        # s2 depends on s1 (in batch) → can't parallelize
+        self.assertEqual(batch, [0])
+
+    def test_find_parallel_batch_allows_completed_deps(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s3", "action_class": "mutate", "edit_mode": "write_file", "target_path": "a.py", "depends_on": ["s1"]},
+            {"id": "s4", "action_class": "mutate", "edit_mode": "write_file", "target_path": "b.py", "depends_on": ["s2"]},
+        ]
+        # s1 and s2 already completed
+        batch = _find_parallel_batch(actions, 0, {"s1", "s2"})
+        self.assertEqual(batch, [0, 1])
+
+    def test_find_parallel_batch_stops_at_same_target(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s1", "action_class": "mutate", "edit_mode": "write_file", "target_path": "a.py"},
+            {"id": "s2", "action_class": "mutate", "edit_mode": "write_file", "target_path": "a.py"},
+        ]
+        batch = _find_parallel_batch(actions, 0, set())
+        self.assertEqual(batch, [0])
+
+    def test_find_parallel_batch_stops_at_different_action_class(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s1", "action_class": "inspect", "edit_mode": "read_file", "target_path": "a.py"},
+            {"id": "s2", "action_class": "mutate", "edit_mode": "write_file", "target_path": "b.py"},
+        ]
+        batch = _find_parallel_batch(actions, 0, set())
+        self.assertEqual(batch, [0])
+
+    def test_find_parallel_batch_requires_target_path(self) -> None:
+        from shipyard.main import _find_parallel_batch
+
+        actions = [
+            {"id": "s1", "action_class": "mutate", "edit_mode": "write_file"},
+            {"id": "s2", "action_class": "mutate", "edit_mode": "write_file", "target_path": "b.py"},
+        ]
+        batch = _find_parallel_batch(actions, 0, set())
+        self.assertEqual(batch, [0])  # no target → single-step batch
+
+    def test_parallel_batch_executes_and_merges(self) -> None:
+        app = Mock()
+        app.invoke.side_effect = [
+            {"status": "edited", "changed_files": ["/tmp/a.py"]},
+            {"status": "edited", "changed_files": ["/tmp/b.py"]},
+            {"status": "edited", "changed_files": ["/tmp/c.py"]},
+        ]
+
+        result = _run_action_plan(
+            app,
+            {"session_id": "demo", "instruction": "edit three files"},
+            {
+                "actions": [
+                    {"id": "s1", "instruction": "edit a", "action_class": "mutate", "edit_mode": "write_file", "target_path": "a.py"},
+                    {"id": "s2", "instruction": "edit b", "action_class": "mutate", "edit_mode": "write_file", "target_path": "b.py"},
+                    {"id": "s3", "instruction": "edit c", "action_class": "mutate", "edit_mode": "write_file", "target_path": "c.py"},
+                ]
+            },
+        )
+
+        self.assertEqual(app.invoke.call_count, 3)
+        self.assertIn("/tmp/a.py", result["changed_files"])
+        self.assertIn("/tmp/b.py", result["changed_files"])
+        self.assertIn("/tmp/c.py", result["changed_files"])
+        # All steps should be marked as parallel_batch
+        for step in result["action_steps"]:
+            self.assertTrue(step.get("parallel_batch"))
+
+
+class PathSandboxingTests(unittest.TestCase):
+    """Tests for workspace path sandboxing in apply_edit."""
+
+    def test_sandbox_target_path_resolves_relative_to_workspace(self) -> None:
+        from shipyard.graph import _sandbox_target_path
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "shipyard.workspaces.WORKSPACE_ROOT", Path(tmpdir) / "workspaces"
+        ):
+            # get_session_workspace maps session_id to "default" workspace
+            workspace = Path(tmpdir) / "workspaces" / "default"
+            workspace.mkdir(parents=True)
+            (workspace / "app.js").write_text("hello", encoding="utf-8")
+
+            result = _sandbox_target_path("app.js", {"session_id": "demo"})
+            self.assertEqual(result, str((workspace / "app.js").resolve()))
+
+    def test_sandbox_target_path_leaves_absolute_unchanged(self) -> None:
+        from shipyard.graph import _sandbox_target_path
+
+        result = _sandbox_target_path("/absolute/path/file.py", {"session_id": "demo"})
+        self.assertEqual(result, "/absolute/path/file.py")
+
+    def test_sandbox_target_path_no_session_returns_as_is(self) -> None:
+        from shipyard.graph import _sandbox_target_path
+
+        result = _sandbox_target_path("app.js", {})
+        self.assertEqual(result, "app.js")
 
 
 if __name__ == "__main__":

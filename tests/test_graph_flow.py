@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from shipyard.graph import apply_edit, build_graph, plan_edit
+from shipyard.graph import apply_edit, build_graph, plan_edit, recover_or_finish
 from shipyard.workspaces import get_session_workspace
 
 
@@ -102,7 +102,6 @@ class GraphFlowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "invalid_proposal")
             self.assertIn("Missing target_path.", result["error"])
-            self.assertEqual(result["human_gate"]["action"], "clarify_request")
             self.assertFalse(result.get("edit_applied", False))
             self.assertEqual(path.read_text(encoding="utf-8"), original)
 
@@ -126,10 +125,12 @@ class GraphFlowTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "failed_after_retries")
             self.assertTrue(result["reverted_to_snapshot"])
-            self.assertEqual(result["human_gate"]["action"], "inspect_failure")
+            self.assertNotIn("human_gate", result)
+            self.assertIsNotNone(result.get("error"))
             self.assertEqual(path.read_text(encoding="utf-8"), original)
 
-    def test_graph_blocks_named_function_edit_when_code_graph_is_unavailable(self) -> None:
+    def test_graph_degrades_named_function_to_write_file_when_code_graph_unavailable_small_file(self) -> None:
+        """Small file: named_function degrades to write_file without blocking."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "demo.py"
             original = "def boot_system():\n    return 'old'\n"
@@ -155,10 +156,45 @@ class GraphFlowTests(unittest.TestCase):
                     }
                 )
 
-            self.assertEqual(result["status"], "graph_unavailable")
-            self.assertIn("Named-function edits require a ready Code-Graph-RAG runtime", result["error"])
-            self.assertEqual(result["human_gate"]["action"], "sync_graph")
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
+            # Small file: should degrade to write_file, not block with graph_unavailable.
+            # The run may still fail for other reasons (e.g. no replacement content in
+            # heuristic mode), but it must NOT be stopped at the code-graph gate.
+            self.assertNotEqual(result.get("status"), "graph_unavailable")
+            self.assertNotEqual(result.get("human_gate", {}).get("action"), "sync_graph")
+
+    def test_graph_degrades_named_function_to_write_file_when_code_graph_unavailable_large_file(self) -> None:
+        """Large file (>150 lines): named_function still degrades to write_file (no blocking)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "demo.py"
+            # Build a file > 150 lines
+            big_content = "# line\n" * 160 + "def boot_system():\n    return 'old'\n"
+            path.write_text(big_content, encoding="utf-8")
+
+            with patch(
+                "shipyard.graph.inspect_code_graph_status",
+                return_value={
+                    "ready": False,
+                    "available": True,
+                    "source": "cgr_stats",
+                    "reason": "Memgraph is not reachable from the current environment.",
+                },
+            ):
+                result = build_graph().invoke(
+                    {
+                        "instruction": "Update boot_system",
+                        "proposal_mode": "heuristic",
+                        "context": {
+                            "file_hint": str(path),
+                            "function_name": "boot_system",
+                        },
+                    }
+                )
+
+            # named_function always degrades to write_file now (no code graph dependency).
+            # It may fail for other reasons (no replacement content in heuristic mode)
+            # but it must NOT stop at the code graph gate.
+            self.assertNotEqual(result.get("status"), "graph_unavailable")
+            self.assertEqual(result["code_graph_status"]["source"], "degraded")
 
     def test_graph_applies_named_function_edit_after_graph_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -188,20 +224,15 @@ class GraphFlowTests(unittest.TestCase):
                     }
                 )
 
+            # named_function now degrades to write_file, so the edit is applied
+            # as a write_file. The file should be updated with the replacement content.
             self.assertEqual(result["status"], "verified")
             self.assertEqual(
                 path.read_text(encoding="utf-8").strip(),
                 "def boot_system():\n    return 'new'",
             )
-            self.assertTrue(result["code_graph_status"]["refresh_required"])
-            self.assertTrue(result["code_graph_status"]["index_state"]["stale"])
-            self.assertTrue(result["code_graph_status"]["context_collected"])
-            self.assertEqual(result["code_graph_status"]["query_mode"], "function_source_only")
-            self.assertEqual(result["helper_output"]["helper_agent"]["agent_name"], "helper-function-planner")
-            self.assertEqual(result["helper_output"]["helper_agent"]["task_type"], "function_edit_planning")
-            self.assertEqual(result["helper_output"]["edit_context"]["mode"], "named_function")
-            self.assertEqual(result["helper_output"]["edit_context"]["function_name"], "boot_system")
-            self.assertIn("return 'old'", result["helper_output"]["edit_context"]["current_source"])
+            # Code graph is no longer required — named_function degrades to write_file
+            self.assertEqual(result["code_graph_status"]["source"], "degraded")
 
     def test_graph_retry_updates_helper_notes_from_verification_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -223,7 +254,47 @@ class GraphFlowTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed_after_retries")
             self.assertIn("Verification failed previously", result["context"]["helper_notes"])
 
+    def test_recover_or_finish_reverts_only_current_step(self) -> None:
+        """recover_or_finish must only revert the current step's target, not earlier steps'
+        successful edits. Reverting all file_transactions would undo prior work."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = Path(tmpdir) / "one.py"
+            second = Path(tmpdir) / "two.py"
+            first.write_text('print("first")\n', encoding="utf-8")
+            second.write_text('print("second")\n', encoding="utf-8")
+            first_snapshot = first.with_suffix(".snap")
+            second_snapshot = second.with_suffix(".snap")
+            first_snapshot.write_text('print("first-old")\n', encoding="utf-8")
+            second_snapshot.write_text('print("second-old")\n', encoding="utf-8")
+
+            result = recover_or_finish(
+                {
+                    "status": "verification_failed",
+                    "target_path": str(second),
+                    "snapshot_path": str(second_snapshot),
+                    "target_existed_before_edit": True,
+                    "file_transactions": [
+                        {
+                            "target_path": str(first),
+                            "snapshot_path": str(first_snapshot),
+                            "target_existed_before_edit": True,
+                        }
+                    ],
+                    "verification_results": [{"command": "python3 main.py", "returncode": 1, "stderr": "bad"}],
+                    "edit_attempts": 1,
+                    "max_edit_attempts": 1,
+                }
+            )
+
+            self.assertEqual(result["status"], "failed_after_retries")
+            # Only the current step's file (second) should be reverted
+            self.assertEqual(second.read_text(encoding="utf-8"), 'print("second-old")\n')
+            # The prior step's file (first) must NOT be reverted — it was already committed
+            self.assertEqual(first.read_text(encoding="utf-8"), 'print("first")\n')
+            self.assertEqual(len(result["reverted_files"]), 1)
+
     def test_graph_supports_write_file_mode(self) -> None:
+        """write_file on an existing file should succeed without full_file_rewrite flag."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "demo.txt"
             path.write_text("old\n", encoding="utf-8")
@@ -232,12 +303,14 @@ class GraphFlowTests(unittest.TestCase):
                 {
                     "instruction": 'write "fresh" to file',
                     "proposal_mode": "heuristic",
-                    "context": {"file_hint": str(path)},
+                    "edit_mode": "write_file",
+                    "target_path": str(path),
+                    "replacement": "fresh\n",
                 }
             )
 
-            self.assertEqual(result["status"], "invalid_proposal")
-            self.assertIn("full_file_rewrite=true", result["error"])
+            self.assertIn(result["status"], {"edited", "verified"})
+            self.assertEqual(path.read_text(encoding="utf-8"), "fresh\n")
 
     def test_graph_scaffold_files_writes_into_session_workspace_in_testing_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch(
@@ -278,7 +351,7 @@ class GraphFlowTests(unittest.TestCase):
     def test_apply_edit_replaces_all_anchor_occurrences_when_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "formatter.py"
-            original = 'return "Average Average"\n'
+            original = 'x = "Average Average"\n'
             path.write_text(original, encoding="utf-8")
 
             result = apply_edit(
@@ -294,12 +367,12 @@ class GraphFlowTests(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "edited")
-            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
+            self.assertEqual(path.read_text(encoding="utf-8"), 'x = "Processed Processed"\n')
 
     def test_apply_edit_replaces_pointer_spans(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "formatter.py"
-            original = 'return "Average Average"\n'
+            original = 'x = "Average Average"\n'
             path.write_text(original, encoding="utf-8")
 
             result = apply_edit(
@@ -309,18 +382,18 @@ class GraphFlowTests(unittest.TestCase):
                     "edit_mode": "anchor",
                     "anchor": "Average",
                     "replacement": "Processed",
-                    "pointers": [{"start": 8, "end": 15}, {"start": 16, "end": 23}],
+                    "pointers": [{"start": 5, "end": 12}, {"start": 13, "end": 20}],
                     "file_before": original,
                 }
             )
 
             self.assertEqual(result["status"], "edited")
-            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
+            self.assertEqual(path.read_text(encoding="utf-8"), 'x = "Processed Processed"\n')
 
     def test_apply_edit_repairs_ambiguous_anchor_with_pointer_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "formatter.py"
-            original = 'return "Average Average"\n'
+            original = 'x = "Average Average"\n'
             path.write_text(original, encoding="utf-8")
 
             with patch(
@@ -329,7 +402,7 @@ class GraphFlowTests(unittest.TestCase):
                     "edit_mode": "anchor",
                     "anchor": "Average",
                     "replacement": "Processed",
-                    "pointers": [{"start": 8, "end": 15}, {"start": 16, "end": 23}],
+                    "pointers": [{"start": 5, "end": 12}, {"start": 13, "end": 20}],
                 },
             ):
                 result = apply_edit(
@@ -346,13 +419,13 @@ class GraphFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["status"], "edited")
-            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed Processed"\n')
-            self.assertEqual(result["pointers"], [{"start": 8, "end": 15}, {"start": 16, "end": 23}])
+            self.assertEqual(path.read_text(encoding="utf-8"), 'x = "Processed Processed"\n')
+            self.assertEqual(result["pointers"], [{"start": 5, "end": 12}, {"start": 13, "end": 20}])
 
     def test_apply_edit_autocorrects_single_exact_anchor_when_invalid_pointers_are_present(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "formatter.py"
-            original = 'return "Average latency"\n'
+            original = 'x = "Average latency"\n'
             path.write_text(original, encoding="utf-8")
 
             result = apply_edit(
@@ -370,8 +443,8 @@ class GraphFlowTests(unittest.TestCase):
             )
 
             self.assertEqual(result["status"], "edited")
-            self.assertEqual(path.read_text(encoding="utf-8"), 'return "Processed latency"\n')
-            self.assertEqual(result["pointers"], [{"start": 8, "end": 15}])
+            self.assertEqual(path.read_text(encoding="utf-8"), 'x = "Processed latency"\n')
+            self.assertEqual(result["pointers"], [{"start": 5, "end": 12}])
 
     def test_plan_edit_refines_preplanned_anchor_from_current_file_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -35,8 +35,12 @@ class StepSection(TypedDict, total=False):
     status: str
     changed_files: list[str]
     no_op: bool
+    retry_count: int
     timeout_seconds: int
     max_retries: int
+    tool_name: str
+    tool_source: str
+    tool_args: dict[str, Any]
 
 
 class TaskSection(TypedDict, total=False):
@@ -97,6 +101,8 @@ class ExecutionSection(TypedDict, total=False):
     max_edit_attempts: int
     snapshot_path: str
     reverted_to_snapshot: bool
+    reverted_files: list[str]
+    revert_count: int
     target_existed_before_edit: bool
     error: str
     changed_files: list[str]
@@ -105,6 +111,8 @@ class ExecutionSection(TypedDict, total=False):
     content_hash: str
     no_op: bool
     tool_output: dict[str, Any]
+    verification_results: list[dict[str, Any]]
+    verification_retry_count: int
 
 
 class VerificationSection(TypedDict, total=False):
@@ -141,6 +149,14 @@ class ActionPlanSection(TypedDict, total=False):
 class ShipyardState(TypedDict, total=False):
     session_id: str
     instruction: str
+    # Broad repo context built once before planning (file tree + key file samples)
+    broad_context: dict[str, Any]
+    # Per-step context files loaded by fetch_step_context (path -> content)
+    live_file_context: dict[str, str]
+    # Last N completed runs for this session, injected before planning
+    session_journal: list[dict[str, Any]]
+    # Set to True to bypass the wide-impact gate for rename_symbol_global / update_imports
+    wide_impact_approved: bool
     target_path: str
     anchor: str
     replacement: str
@@ -163,12 +179,16 @@ class ShipyardState(TypedDict, total=False):
     current_function_source: str
     file_before: str
     snapshot_path: str
+    file_transactions: list[dict[str, Any]]
     target_existed_before_edit: bool
     reverted_to_snapshot: bool
+    reverted_files: list[str]
+    revert_count: int
     edit_applied: bool
     edit_attempts: int
     max_edit_attempts: int
     verification_results: list[dict[str, Any]]
+    verification_retry_count: int
     status: str
     error: str
     trace_path: str
@@ -179,6 +199,10 @@ class ShipyardState(TypedDict, total=False):
     no_op: bool
     tool_output: dict[str, Any]
     tool_outputs: list[dict[str, Any]]
+    tool_name: str
+    tool_source: str
+    tool_args: dict[str, Any]
+    tool_result: dict[str, Any]
     graph_sync: dict[str, Any]
     spec_bundle: dict[str, Any]
     action_plan: ActionPlanSection

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .planning_hints import extract_explicit_filenames
-from .workspaces import get_session_workspace
+from .workspaces import get_session_workspace, get_session_workspace_selection
 
 
 IGNORED_NAMES = {".git", ".venv", "__pycache__"}
@@ -32,11 +32,13 @@ def build_repo_context_lines(
     if top_level:
         lines.append("Top-level tree: " + ", ".join(top_level))
 
+    workspace_selection = get_session_workspace_selection(session_id)
     workspace = get_session_workspace(session_id).resolve()
     if workspace.exists():
         workspace_files = _collect_relative_files(workspace, workspace, max_workspace_files)
         if workspace_files:
-            lines.append(f"Session workspace: {workspace.name}")
+            label = str(workspace_selection.get("workspace_label") or workspace.name)
+            lines.append(f"Session workspace: {label}")
             lines.append("Workspace files: " + ", ".join(workspace_files))
 
     if target_path:

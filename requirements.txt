@@ -2,3 +2,4 @@ langgraph>=1.0.10
 fastapi>=0.116.0
 uvicorn>=0.35.0
 code-graph-rag>=0.0.148
+rope>=1.13.0

@@ -63,9 +63,16 @@ def get_planner_status() -> dict[str, Any]:
     }
 
 
+def _get_primary_model(state: dict) -> str:
+    m = state.get("proposal_model")
+    if m:
+        return str(m)
+    return os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+
+
 def _openai_or_fallback(state: ShipyardState) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
-    model = state.get("proposal_model") or os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
+    model = _get_primary_model(state)
     if not api_key:
         proposal = _heuristic_proposal(state)
         proposal["provider"] = "heuristic"
@@ -74,7 +81,7 @@ def _openai_or_fallback(state: ShipyardState) -> dict[str, Any]:
 
     prompt = build_proposal_prompt(state)
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=45.0) as client:
             response = client.post(
                 "https://api.openai.com/v1/responses",
                 headers={
