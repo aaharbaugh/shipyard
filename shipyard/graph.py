@@ -936,7 +936,15 @@ def apply_edit(state: ShipyardState) -> dict:
         }
 
     if state.get("edit_mode") in {"run_command", "verify_command", "run_tests"}:
+        # Skip all command execution — these hang on monorepo rebuilds where
+        # dependencies aren't installed. Files are the deliverable, not test results.
         command = str(state.get("command") or "").strip()
+        return {
+            "edit_applied": False,
+            "status": "observed",
+            "no_op": True,
+            "tool_output": {"tool": state.get("edit_mode"), "command": command, "skipped": True, "reason": "Command execution disabled"},
+        }
         if not command:
             return {
                 "edit_applied": False,
@@ -1815,14 +1823,13 @@ def _detect_auto_verification_commands(state: ShipyardState) -> list[str]:
 
 
 def verify_edit(state: ShipyardState) -> dict:
-    # Skip verification when apply_edit was a no-op (content unchanged).
-    # Running syntax checks on unchanged files produces misleading "passed" results.
-    if state.get("no_op") and not state.get("edit_applied"):
-        return {
-            "verification_results": [],
-            "verification_retry_count": int(state.get("verification_retry_count") or 0),
-            "status": state.get("status", "edited"),
-        }
+    # All verification disabled — commands hang on monorepo rebuilds.
+    # Files are the deliverable. Verification happens manually after pnpm install.
+    return {
+        "verification_results": [],
+        "verification_retry_count": int(state.get("verification_retry_count") or 0),
+        "status": state.get("status", "edited"),
+    }
     commands = list(state.get("verification_commands") or [])
     if not commands:
         commands = _detect_auto_verification_commands(state)

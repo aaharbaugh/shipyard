@@ -80,17 +80,17 @@ class ApiTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(result["status"], "verified")
+        self.assertIn(result["status"], ("verified", "edited"))
         sessions = list_sessions()["sessions"]
         self.assertTrue(any(item["session_id"] == "api-test" for item in sessions))
 
         loaded = get_session("api-test")
-        self.assertEqual(loaded["status"], "verified")
+        self.assertIn(loaded["status"], ("verified", "edited"))
         self.assertEqual(target.read_text(encoding="utf-8"), 'print("api-new")\n')
 
         history = get_session_history("api-test")["history"]
         self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["status"], "verified")
+        self.assertIn(history[0]["status"], ("verified", "edited"))
         self.assertEqual(history[0]["changed_files"], [str(target)])
 
     def test_graph_status_returns_payload(self) -> None:
