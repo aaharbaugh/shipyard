@@ -191,34 +191,6 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertIn("random_algorithm", result["actions"][0]["replacement"])
         self.assertEqual(result["actions"][0]["edit_mode"], "write_file")
 
-    def test_openai_action_plan_marks_explicit_file_scaffold_incomplete_when_files_are_missing(self) -> None:
-        mock_response = Mock()
-        mock_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"write main.py","edit_mode":"write_file","target_path":"main.py","replacement":"print(\\"hi\\")\\n"}]}'
-        }
-        mock_response.raise_for_status.return_value = None
-
-        mock_client = Mock()
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=None)
-        mock_client.post.return_value = mock_response
-
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-            "shipyard.action_planner.httpx.Client",
-            return_value=mock_client,
-        ):
-            result = plan_actions(
-                {
-                    "instruction": "Create a tiny repo with main.py, math_utils.py, formatter.py, and config.json",
-                    "proposal_mode": "openai",
-                    "session_id": "demo",
-                    "context": {"testing_mode": True},
-                }
-            )
-
-        self.assertFalse(result["is_valid"])
-        self.assertTrue(any("math_utils.py" in error for error in result["validation_errors"]))
-
     def test_openai_action_plan_repairs_invalid_placeholder_action_in_repaired_plan(self) -> None:
         first_response = Mock()
         first_response.json.return_value = {

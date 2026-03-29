@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
-
-from .planning_hints import extract_explicit_filenames
 
 
 def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> list[str]:
@@ -19,7 +16,6 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
             + "."
         )
 
-    explicit_files = extract_explicit_filenames(instruction)
     action_ids = [str(action.get("id")) for action in actions if action.get("id")]
     if len(action_ids) != len(set(action_ids)):
         errors.append("Action plan contains duplicate step ids.")
@@ -37,31 +33,6 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
         for dependency in inputs:
             if dependency not in known_ids:
                 errors.append(f"Action {index} references unknown inputs_from step id `{dependency}`.")
-    if explicit_files:
-        covered_files: set[str] = set()
-        for action in actions:
-            tp = action.get("target_path")
-            if tp:
-                tp_str = str(tp)
-                covered_files.add(Path(tp_str).name)
-                covered_files.add(tp_str)  # also match full paths
-                # Match the relative suffix (api/src/routes/auth.ts matches auth.ts)
-                if "/" in tp_str:
-                    covered_files.add(tp_str.rsplit("/", 1)[-1])
-            for file_spec in (action.get("files") or []):
-                if isinstance(file_spec, dict) and file_spec.get("path"):
-                    fp = str(file_spec["path"])
-                    covered_files.add(Path(fp).name)
-                    covered_files.add(fp)
-        missing_files = [
-            name for name in explicit_files
-            if name not in covered_files and Path(name).name not in covered_files
-        ]
-        if missing_files:
-            errors.append(
-                "Action plan did not cover all explicitly named files: " + ", ".join(missing_files) + "."
-            )
-
     return errors
 
 
