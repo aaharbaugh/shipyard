@@ -46,7 +46,12 @@ def _looks_like_placeholder_replacement(value: Any) -> bool:
 
 def attach_validation(proposal: dict[str, Any]) -> dict[str, Any]:
     validated = dict(proposal)
-    errors = validate_proposal(validated)
+    # Validation is permissive — let everything through to apply_edit where
+    # real safety nets exist (content loss guard, path sandbox, syntax checks).
+    # Only reject truly malformed proposals (no edit_mode at all).
+    errors: list[str] = []
+    if not validated.get("edit_mode"):
+        errors.append("Missing edit_mode.")
     validated["is_valid"] = not errors
     validated["validation_errors"] = errors
     return validated

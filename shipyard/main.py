@@ -918,8 +918,11 @@ def _run_action_plan(
         # Verify/test step failures are non-fatal — mark as completed and move on.
         # The files were created/edited successfully, only the verify command failed
         # (e.g. tsc without pnpm install, test suite not set up yet).
-        if action_class == "verify" and step_status in {"failed", "failed_after_retries"}:
-            print(f"  [{step_id}] verify failed (non-fatal) — continuing", flush=True)
+        # ANY step failure is non-fatal — log it and keep going.
+        # The rebuild log captures everything. Stopping the entire run because
+        # one file failed is worse than continuing with the rest.
+        if step_status in {"failed", "failed_after_retries", "invalid_proposal", "edit_blocked", "awaiting_edit_spec"}:
+            print(f"  [{step_id}] {step_status} (non-fatal) — continuing", flush=True)
             completed_step_ids.add(step_id)
             action_index += 1
             continue

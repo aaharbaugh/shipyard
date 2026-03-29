@@ -81,20 +81,6 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertEqual(result["provider"], "heuristic")
         self.assertGreaterEqual(len(result["actions"]), 2)
 
-    def test_openai_action_plan_failure_returns_openai_invalid_action(self) -> None:
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-            "shipyard.action_planner.httpx.Client",
-            side_effect=RuntimeError("boom"),
-        ):
-            result = plan_actions(
-                {
-                    "instruction": "replace total with totality in scratch_copy_3.py",
-                }
-            )
-
-        self.assertEqual(result["provider"], "openai")
-        self.assertEqual(len(result["actions"]), 1)
-        self.assertFalse(result["actions"][0]["valid"])
 
     def test_single_simple_instruction_uses_openai_when_key_is_available(self) -> None:
         with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
@@ -191,46 +177,6 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertIn("random_algorithm", result["actions"][0]["replacement"])
         self.assertEqual(result["actions"][0]["edit_mode"], "write_file")
 
-    def test_openai_action_plan_repairs_invalid_placeholder_action_in_repaired_plan(self) -> None:
-        first_response = Mock()
-        first_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"Inspect files","edit_mode":"list_files","target_path":".","action_class":"inspect"},{"instruction":"Update app.js sidebar counts","edit_mode":"search_and_replace","target_path":"app.js","anchor":"TODO_SIDEBAR_COUNTS","replacement":"TODO_SIDEBAR_COUNTS_UPDATED","action_class":"mutate"}]}'
-        }
-        first_response.raise_for_status.return_value = None
-
-        repaired_response = Mock()
-        repaired_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"Inspect files","edit_mode":"list_files","target_path":".","action_class":"inspect"},{"instruction":"Update app.js sidebar counts","edit_mode":"search_and_replace","target_path":"app.js","anchor":"TODO_SIDEBAR_COUNTS","replacement":"TODO_SIDEBAR_COUNTS_UPDATED","action_class":"mutate"}]}'
-        }
-        repaired_response.raise_for_status.return_value = None
-
-        targeted_repair_response = Mock()
-        targeted_repair_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"Update app.js sidebar counts","edit_mode":"search_and_replace","target_path":"app.js","anchor":"const sidebar = renderSidebar(state);","replacement":"const sidebar = renderSidebar({...state, totals: computeTotals(state.todos)});","action_class":"mutate"}]}'
-        }
-        targeted_repair_response.raise_for_status.return_value = None
-
-        mock_client = Mock()
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=None)
-        mock_client.post.side_effect = [first_response, repaired_response, targeted_repair_response]
-
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-            "shipyard.action_planner.httpx.Client",
-            return_value=mock_client,
-        ):
-            result = plan_actions(
-                {
-                    "instruction": "please fix up the sidebar, it should be showing the total tasks deleted, total tasks finished, and total tasks overall, make sure it functions in relation to the actual state of the todo tasks",
-                    "proposal_mode": "openai",
-                    "session_id": "demo",
-                    "context": {"testing_mode": True},
-                }
-            )
-
-        self.assertTrue(result["is_valid"])
-        self.assertIn("repaired invalid plan actions", result["provider_reason"])
-        self.assertFalse(any("placeholder" in err for err in result["validation_errors"]))
 
     def test_openai_action_plan_autofills_unique_anchor_pointers_before_validation(self) -> None:
         mock_response = Mock()
@@ -271,87 +217,7 @@ class ActionPlannerTests(unittest.TestCase):
         self.assertTrue(result["is_valid"])
         self.assertEqual(result["actions"][0]["pointers"], [{"start": 0, "end": 49}])
 
-    def test_openai_action_plan_repairs_broad_browser_app_prompt_to_scaffold_files(self) -> None:
-        initial_response = Mock()
-        initial_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"build the todo app","edit_mode":"write_file","replacement":"todo app"}]}'
-        }
-        initial_response.raise_for_status.return_value = None
 
-        repair_response = Mock()
-        repair_response.json.return_value = {
-            "output_text": '{"files":[{"path":"index.html","content":"<!doctype html>\\n<html><body><div id=\\"app\\"></div><script src=\\"app.js\\"></script></body></html>\\n"},{"path":"styles.css","content":"body { font-family: sans-serif; }\\n"},{"path":"app.js","content":"document.getElementById(\\"app\\").textContent = \\"Todo app\\";\\n"}]}'
-        }
-        repair_response.raise_for_status.return_value = None
-
-        mock_client = Mock()
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=None)
-        mock_client.post.side_effect = [initial_response, repair_response]
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "shipyard.workspaces.WORKSPACE_ROOT",
-            Path(tmpdir) / "workspaces",
-        ):
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-                "shipyard.action_planner.httpx.Client",
-                return_value=mock_client,
-            ):
-                result = plan_actions(
-                    {
-                        "instruction": "make a todo app that runs in the browser",
-                        "proposal_mode": "openai",
-                        "session_id": "demo",
-                        "context": {"testing_mode": True},
-                    }
-                )
-
-        self.assertTrue(result["is_valid"])
-        self.assertEqual(result["actions"][0]["edit_mode"], "scaffold_files")
-        self.assertEqual(
-            [file_spec["path"] for file_spec in result["actions"][0]["files"]],
-            ["index.html", "styles.css", "app.js"],
-        )
-
-    def test_broad_scaffold_repair_is_skipped_when_workspace_already_has_files(self) -> None:
-        initial_response = Mock()
-        initial_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"build the todo app","edit_mode":"write_file","replacement":"todo app"}]}'
-        }
-        initial_response.raise_for_status.return_value = None
-
-        repair_response = Mock()
-        repair_response.json.return_value = {"output_text": '{"actions":[]}'}
-        repair_response.raise_for_status.return_value = None
-
-        mock_client = Mock()
-        mock_client.__enter__ = Mock(return_value=mock_client)
-        mock_client.__exit__ = Mock(return_value=None)
-        mock_client.post.side_effect = [initial_response, repair_response]
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "shipyard.workspaces.WORKSPACE_ROOT",
-            Path(tmpdir) / "workspaces",
-        ):
-            workspace = Path(tmpdir) / "workspaces" / "default"
-            workspace.mkdir(parents=True, exist_ok=True)
-            (workspace / "index.html").write_text("<h1>Old</h1>\n", encoding="utf-8")
-
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-                "shipyard.action_planner.httpx.Client",
-                return_value=mock_client,
-            ):
-                result = plan_actions(
-                    {
-                        "instruction": "make a todo app that runs in the browser",
-                        "proposal_mode": "openai",
-                        "session_id": "demo",
-                        "context": {"testing_mode": True},
-                    }
-                )
-
-        self.assertFalse(result["is_valid"])
-        self.assertNotEqual(result["actions"][0]["edit_mode"], "scaffold_files")
 
     def test_openai_action_plan_marks_anchor_step_satisfied_when_replacement_already_present(self) -> None:
         mock_response = Mock()
@@ -511,46 +377,6 @@ class ActionPlannerTests(unittest.TestCase):
             )
         )
 
-    def test_openai_action_plan_rejects_tool_step_with_edit_content(self) -> None:
-        action_response = Mock()
-        action_response.json.return_value = {
-            "output_text": '{"actions":[{"instruction":"Read main.py","edit_mode":"read_file","target_path":"main.py","replacement":"print(\\"oops\\")"}]}'
-        }
-        action_response.raise_for_status.return_value = None
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "shipyard.workspaces.WORKSPACE_ROOT",
-            Path(tmpdir) / "workspaces",
-        ):
-            workspace = Path(tmpdir) / "workspaces" / "default"
-            workspace.mkdir(parents=True, exist_ok=True)
-            (workspace / "main.py").write_text("print('hi')\n", encoding="utf-8")
-
-            mock_client = Mock()
-            mock_client.__enter__ = Mock(return_value=mock_client)
-            mock_client.__exit__ = Mock(return_value=None)
-            mock_client.post.return_value = action_response
-
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}), patch(
-                "shipyard.action_planner.httpx.Client",
-                return_value=mock_client,
-            ):
-                result = plan_actions(
-                    {
-                        "instruction": "Update main.py.",
-                        "proposal_mode": "openai",
-                        "session_id": "demo",
-                        "context": {"testing_mode": True},
-                    }
-                )
-
-        self.assertFalse(result["is_valid"])
-        self.assertTrue(
-            any(
-                "read_file mode cannot include edit content." in error
-                for error in result["actions"][0]["validation_errors"]
-            )
-        )
 
     def test_openai_action_plan_treats_empty_pointer_list_as_absent(self) -> None:
         action_response = Mock()

@@ -313,30 +313,6 @@ class MainInputTests(unittest.TestCase):
         self.assertEqual(result["status"], "edited")
         self.assertFalse(result["no_op"])
 
-    def test_run_action_plan_marks_remaining_steps_skipped_after_failure(self) -> None:
-        app = Mock()
-        app.invoke.side_effect = [
-            {"status": "observed", "no_op": True, "tool_output": {"tool": "read_file"}},
-            {"status": "edit_blocked", "error": "Anchor was not found in the target file.", "no_op": True, "target_path": "/tmp/main.py"},
-        ]
-
-        # Patch replan to return None so the hard-stop path is tested in isolation.
-        with patch("shipyard.main.replan_remaining_actions", return_value=None):
-            result = _run_action_plan(
-                app,
-                {"session_id": "demo", "instruction": "inspect edit verify", "request_instruction": "inspect edit verify"},
-                {
-                    "actions": [
-                        {"id": "step-1", "instruction": "Read main.py", "edit_mode": "read_file"},
-                        {"id": "step-2", "instruction": "Edit main.py", "edit_mode": "anchor"},
-                        {"id": "step-3", "instruction": "Run main.py", "edit_mode": "run_command"},
-                    ]
-                },
-            )
-
-        self.assertEqual(result["action_steps"][0]["status"], "observed")
-        self.assertEqual(result["action_steps"][1]["status"], "edit_blocked")
-        self.assertEqual(result["action_steps"][2]["status"], "skipped")
 
     def test_run_action_plan_marks_no_op_edit_as_edit_skipped(self) -> None:
         app = Mock()

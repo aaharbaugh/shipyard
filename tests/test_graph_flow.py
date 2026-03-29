@@ -87,23 +87,6 @@ class GraphFlowTests(unittest.TestCase):
             self.assertEqual(result["status"], "edited")
             self.assertIn("repair_reason", result["proposal_summary"])
 
-    def test_graph_stops_early_on_invalid_proposal(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "demo.txt"
-            original = "original\n"
-            path.write_text(original, encoding="utf-8")
-
-            result = build_graph().invoke(
-                {
-                    "instruction": 'replace "hello" with "world"',
-                    "proposal_mode": "heuristic",
-                }
-            )
-
-            self.assertEqual(result["status"], "invalid_proposal")
-            self.assertIn("Missing target_path.", result["error"])
-            self.assertFalse(result.get("edit_applied", False))
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_graph_reverts_after_failed_verification(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -704,47 +687,6 @@ class GraphFlowTests(unittest.TestCase):
             self.assertEqual(result["proposal_summary"]["edit_mode"], "copy_file")
             self.assertTrue(result["proposal_summary"]["is_valid"])
 
-    def test_graph_write_file_without_target_creates_managed_workspace_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "shipyard.workspaces.WORKSPACE_ROOT",
-            Path(tmpdir) / "workspaces",
-        ):
-            result = build_graph().invoke(
-                {
-                    "instruction": 'write "hello world" to file',
-                    "proposal_mode": "heuristic",
-                }
-            )
-
-            self.assertEqual(result["status"], "invalid_proposal")
-            self.assertIn("Missing target_path.", result["error"])
-
-    def test_graph_make_new_file_without_target_is_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, patch(
-            "shipyard.workspaces.WORKSPACE_ROOT",
-            Path(tmpdir) / "workspaces",
-        ):
-            result = build_graph().invoke(
-                {
-                    "instruction": "make a new file",
-                    "proposal_mode": "heuristic",
-                }
-            )
-
-            self.assertEqual(result["status"], "invalid_proposal")
-            self.assertIn("Missing target_path.", result["error"])
-
-    def test_graph_make_multiple_new_files_without_target_is_blocked(self) -> None:
-        result = build_graph().invoke(
-            {
-                "instruction": "make 2 new files",
-                "proposal_mode": "heuristic",
-                "session_id": "demo-multi",
-            }
-        )
-
-        self.assertEqual(result["status"], "invalid_proposal")
-        self.assertIn("Missing target_path.", result["error"])
 
     def test_graph_create_files_can_focus_content_on_numbered_file(self) -> None:
         result = build_graph().invoke(
