@@ -294,6 +294,29 @@ def _discover_test_command(state: ShipyardState) -> str | None:
         return None
 
 
+def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool:
+    """Check if the agent should automatically continue to the next phase."""
+    instruction = (state.get("instruction") or "").lower()
+    # Only continue if the instruction explicitly asked for all phases
+    _continuous_signals = ("all phases", "every phase", "all steps", "entire plan", "whole plan", "execute everything")
+    if not any(signal in instruction for signal in _continuous_signals):
+        return False
+    # Don't continue on hard failures (invalid plan, exception)
+    status = result.get("status", "")
+    if status in ("invalid_action_plan", "cancelled"):
+        return False
+    # Don't continue if nothing was created/edited (stuck)
+    changed = result.get("changed_files") or []
+    steps = result.get("action_steps") or []
+    had_work = bool(changed) or any(s.get("status") in ("edited", "verified") for s in steps)
+    if not had_work:
+        return False
+    # Cap at 20 iterations
+    if state.get("_phase_iteration", 0) >= 20:
+        return False
+    return True
+
+
 _REBUILD_LOG_PATH = Path(".shipyard/data/rebuild_log.jsonl")
 
 
@@ -508,6 +531,41 @@ def run_once(
         result = _persist_result(session_store, result)
         _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
+
+        # Continuous execution: if the instruction asked for "all phases" and work
+        # was done (not a total failure), keep going with the next phase.
+        if _should_continue_phases(state, result):
+            phase_num = state.get("_phase_iteration", 0) + 1
+            max_phases = 20  # hard cap
+            if phase_num < max_phases:
+                print(f"\n[continuous] phase iteration {phase_num} — continuing...", flush=True)
+                _emit_progress(progress_callback, "continuous", {"phase": phase_num})
+                next_state = {
+                    **state,
+                    "instruction": (
+                        f"Read REBUILD_PLAN.md. Continue executing the NEXT unfinished phase. "
+                        f"The previous run completed {len(result.get('changed_files') or [])} file(s). "
+                        f"Look at what files already exist and execute the next phase that hasn't been done yet. "
+                        f"Create all files with full content. Skip verification commands that require installed dependencies."
+                    ),
+                    "_phase_iteration": phase_num,
+                    "tool_outputs": [],
+                    "context": {
+                        **dict(state.get("context") or {}),
+                        "tool_outputs": [],
+                    },
+                }
+                continuation = run_once(app, session_store, next_state, progress_callback)
+                # Merge results
+                combined_changed = list({
+                    *list(result.get("changed_files") or []),
+                    *list(continuation.get("changed_files") or []),
+                })
+                continuation["changed_files"] = combined_changed
+                continuation["_phase_iteration"] = phase_num
+                continuation["continuous_phases_completed"] = phase_num
+                return continuation
+
         return result
     except PlanningCancelledError:
         result = {
