@@ -240,6 +240,9 @@ def normalize_action(
     edit_mode = str(raw_action.get("edit_mode") or fallback.get("edit_mode") or "anchor").strip()
     if edit_mode not in SUPPORTED_ACTIONS:
         edit_mode = str(fallback.get("edit_mode") or "anchor")
+    # Auto-convert create_files with a single target to write_file
+    if edit_mode == "create_files" and raw_action.get("target_path") and not raw_action.get("quantity"):
+        edit_mode = "write_file"
     action_class = str(raw_action.get("action_class") or fallback.get("action_class") or ACTION_CLASSES.get(edit_mode, "mutate")).strip()
 
     replacement = raw_action.get("replacement")

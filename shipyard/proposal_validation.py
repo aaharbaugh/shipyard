@@ -151,10 +151,11 @@ def validate_proposal(proposal: dict[str, Any]) -> list[str]:
         # full_file_rewrite is advisory metadata — write_file mode already implies a full
         # rewrite, so the LLM not setting this flag should not block execution.
     elif edit_mode == "create_files":
+        # If target_path is set, treat as a single file creation (quantity=1 implied)
         quantity = proposal.get("quantity")
-        if quantity is None:
-            errors.append("create_files mode requires quantity.")
-        else:
+        if quantity is None and not target_path:
+            errors.append("create_files mode requires quantity or target_path.")
+        elif quantity is not None:
             try:
                 if int(quantity) < 1:
                     errors.append("create_files mode requires quantity >= 1.")
