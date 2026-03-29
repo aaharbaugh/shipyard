@@ -282,8 +282,9 @@ WORKBENCH_HTML = """<!doctype html>
     .pill {
       white-space: nowrap;
       border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 0.88rem;
+      padding: 3px 8px;
+      font-size: 0.74rem;
+      font-weight: 600;
       border: 1px solid var(--line);
       background: var(--soft);
     }
@@ -659,84 +660,92 @@ WORKBENCH_HTML = """<!doctype html>
     }
     .activity-stream {
       display: grid;
-      gap: 12px;
+      gap: 6px;
       align-content: start;
-      padding: 6px 2px 2px;
+      padding: 4px 0;
     }
     .activity-scroll {
       overflow: auto;
-      padding: 10px 2px 14px;
+      padding: 8px 2px 10px;
       min-height: 0;
     }
     .message {
       display: grid;
-      gap: 8px;
-      max-width: min(720px, 100%);
+      gap: 2px;
+      max-width: 100%;
     }
     .message.user {
       justify-self: end;
+      max-width: 85%;
     }
     .message.assistant {
       justify-self: start;
     }
     .message-label {
-      font-size: 0.76rem;
-      color: var(--muted);
+      font-size: 0.7rem;
+      color: rgba(226, 232, 240, 0.5);
       text-transform: uppercase;
       letter-spacing: 0.08em;
-      font-weight: 700;
-      padding: 0 4px;
+      font-weight: 600;
+      padding: 0 2px;
     }
     .message-bubble {
       display: grid;
-      gap: 10px;
-      padding: 14px;
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      background: var(--panel-strong);
-      box-shadow: 0 10px 30px rgba(21, 32, 51, 0.05);
+      gap: 6px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(148, 163, 184, 0.12);
+      background: transparent;
     }
     .message.user .message-bubble {
-      background: rgba(21, 101, 216, 0.9);
-      color: white;
+      background: rgba(21, 101, 216, 0.18);
+      color: #c4daf8;
       border-color: rgba(21, 101, 216, 0.25);
     }
     .message.assistant .message-bubble {
-      background: rgba(255, 255, 255, 0.08);
-      border-color: rgba(148, 163, 184, 0.18);
-      color: #e8eef8;
+      background: transparent;
+      border-color: rgba(148, 163, 184, 0.1);
+      color: #c8d4e4;
     }
     .message.user .message-bubble .meta-line {
-      color: rgba(255, 255, 255, 0.84);
+      color: rgba(196, 218, 248, 0.7);
     }
     .message-text {
-      font-size: 0.98rem;
-      line-height: 1.45;
+      font-size: 0.88rem;
+      line-height: 1.4;
       word-break: break-word;
     }
     .message-meta {
-      display: grid;
-      gap: 4px;
-      font-size: 0.88rem;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 0.78rem;
+      color: rgba(226, 232, 240, 0.5);
+    }
+    .message-meta .meta-line:not(:last-child)::after {
+      content: "·";
+      margin-left: 8px;
+      color: rgba(226, 232, 240, 0.3);
     }
     .message-details {
       display: grid;
-      gap: 10px;
+      gap: 4px;
     }
     .task-block {
       display: grid;
-      gap: 10px;
-      padding: 12px;
-      border-radius: 14px;
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      background: rgba(15, 23, 42, 0.28);
+      gap: 4px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.1);
+      background: rgba(15, 23, 42, 0.2);
+      font-size: 0.82rem;
     }
     .task-block-title {
-      font-size: 0.78rem;
-      letter-spacing: 0.08em;
+      font-size: 0.72rem;
+      letter-spacing: 0.06em;
       text-transform: uppercase;
-      color: rgba(226, 232, 240, 0.68);
-      font-weight: 700;
+      color: rgba(226, 232, 240, 0.5);
+      font-weight: 600;
     }
     .task-grid {
       display: grid;
@@ -795,51 +804,61 @@ WORKBENCH_HTML = """<!doctype html>
     }
     .composer {
       display: grid;
-      gap: 10px;
-      padding-top: 14px;
-      border-top: 1px solid rgba(148, 163, 184, 0.16);
+      gap: 6px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(148, 163, 184, 0.1);
     }
     .composer textarea {
-      min-height: 84px;
-      max-height: 220px;
-      border-radius: 16px;
-      border-color: rgba(148, 163, 184, 0.18);
-      background: rgba(255, 255, 255, 0.08);
+      min-height: 40px;
+      max-height: 160px;
+      padding: 10px 14px;
+      border-radius: 12px;
+      border-color: rgba(148, 163, 184, 0.15);
+      background: rgba(255, 255, 255, 0.06);
       color: #f8fafc;
       resize: none;
       overflow: hidden;
+      font-size: 0.9rem;
+      line-height: 1.4;
+    }
+    .composer textarea:focus {
+      border-color: rgba(21, 101, 216, 0.4);
+      outline: none;
+      background: rgba(255, 255, 255, 0.08);
     }
     .composer textarea::placeholder {
-      color: rgba(226, 232, 240, 0.52);
+      color: rgba(226, 232, 240, 0.4);
     }
     .composer-bar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      gap: 8px;
     }
     .composer-actions {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 6px;
       flex-wrap: wrap;
       justify-content: flex-end;
     }
     .composer-hint {
-      font-size: 0.84rem;
-      color: rgba(226, 232, 240, 0.68);
+      font-size: 0.76rem;
+      color: rgba(226, 232, 240, 0.4);
     }
     .ghost-button {
       width: auto;
-      padding: 8px 12px;
+      padding: 5px 10px;
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.14);
-      border-color: rgba(148, 163, 184, 0.34);
-      color: #ffffff;
+      background: rgba(255, 255, 255, 0.08);
+      border-color: rgba(148, 163, 184, 0.2);
+      color: rgba(255, 255, 255, 0.7);
       font-weight: 600;
+      font-size: 0.78rem;
     }
     .ghost-button:hover {
-      background: rgba(255, 255, 255, 0.2);
+      background: rgba(255, 255, 255, 0.14);
+      color: #fff;
     }
     .ghost-button:disabled,
     .composer textarea:disabled {
@@ -899,41 +918,42 @@ WORKBENCH_HTML = """<!doctype html>
     }
     .verify-block {
       display: grid;
-      gap: 6px;
-      padding: 10px 12px;
-      border-radius: 12px;
+      gap: 3px;
+      padding: 6px 8px;
+      border-radius: 8px;
       border: 1px solid;
-      font-size: 0.84rem;
+      font-size: 0.78rem;
     }
     .verify-block.pass {
-      border-color: rgba(31, 180, 100, 0.3);
-      background: rgba(31, 180, 100, 0.08);
+      border-color: rgba(31, 180, 100, 0.2);
+      background: rgba(31, 180, 100, 0.06);
       color: #6ee7b7;
     }
     .verify-block.fail {
-      border-color: rgba(220, 60, 60, 0.3);
-      background: rgba(220, 60, 60, 0.08);
+      border-color: rgba(220, 60, 60, 0.2);
+      background: rgba(220, 60, 60, 0.06);
       color: #fca5a5;
     }
     .verify-block-label {
-      font-size: 0.76rem;
-      font-weight: 700;
+      font-size: 0.72rem;
+      font-weight: 600;
       letter-spacing: 0.06em;
       text-transform: uppercase;
-      opacity: 0.82;
+      opacity: 0.7;
     }
     .verify-line {
-      opacity: 0.9;
+      opacity: 0.8;
       word-break: break-word;
       font-family: ui-monospace, "Cascadia Code", monospace;
+      font-size: 0.76rem;
     }
     .gate-block {
       display: grid;
-      gap: 10px;
-      padding: 12px 14px;
-      border-radius: 12px;
-      border: 1px solid rgba(251, 191, 36, 0.32);
-      background: rgba(251, 191, 36, 0.07);
+      gap: 6px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(251, 191, 36, 0.2);
+      background: rgba(251, 191, 36, 0.05);
     }
     .gate-block-label {
       font-size: 0.76rem;
@@ -985,9 +1005,7 @@ WORKBENCH_HTML = """<!doctype html>
           <div class="activity-stream" id="activity_stream"></div>
         </div>
         <div class="composer">
-          <textarea id="instruction" placeholder='Type a prompt and press Enter.
-
-Shift+Enter adds a new line.'></textarea>
+          <textarea id="instruction" placeholder='What should Shipyard do?'></textarea>
           <div class="composer-bar">
             <div class="composer-hint">Enter to run. Shift+Enter for a new line.</div>
             <div class="composer-actions">
@@ -1551,18 +1569,48 @@ Shift+Enter adds a new line.'></textarea>
       }).join("");
     }
 
-    function renderActivityStream(messages) {
-      activityStreamEl.innerHTML = messages.map((message) => `
-        <div class="message ${message.role}">
-          <div class="message-label">${message.label}</div>
+    function _renderMessageHtml(message) {
+      return `
+        <div class="message ${message.role}" data-msg-id="${message.id || ''}">
+          <div class="message-label">${message.label || ''}</div>
           <div class="message-bubble">
-            <div class="message-text">${message.text}</div>
+            <div class="message-text">${message.text || ''}</div>
             ${message.detailsHtml ? `<div class="message-details">${message.detailsHtml}</div>` : ""}
-            ${message.badge ? `<div><span class="pill${message.badgeTone ? ` ${message.badgeTone}` : " neutral"}">${message.badge}</span></div>` : ""}
+            ${message.badge ? `<span class="pill${message.badgeTone ? ` ${message.badgeTone}` : " neutral"}">${message.badge}</span>` : ""}
             ${message.meta && message.meta.length ? `<div class="message-meta">${message.meta.map((item) => `<span class="meta-line">${item}</span>`).join("")}</div>` : ""}
           </div>
-        </div>
-      `).join("");
+        </div>`;
+    }
+
+    function renderActivityStream(messages) {
+      // Incremental update: only re-render changed messages to avoid flicker
+      const existingEls = activityStreamEl.querySelectorAll("[data-msg-id]");
+      const existingIds = new Set([...existingEls].map(el => el.dataset.msgId));
+      const newIds = new Set(messages.map(m => m.id || ''));
+
+      // Remove messages no longer present
+      existingEls.forEach(el => {
+        if (!newIds.has(el.dataset.msgId)) el.remove();
+      });
+
+      // Add or update messages
+      for (const message of messages) {
+        const id = message.id || '';
+        const existing = activityStreamEl.querySelector(`[data-msg-id="${CSS.escape(id)}"]`);
+        if (existing) {
+          // Update in place — only touch innerHTML if content changed
+          const html = _renderMessageHtml(message);
+          const temp = document.createElement('div');
+          temp.innerHTML = html;
+          const newEl = temp.firstElementChild;
+          if (existing.innerHTML !== newEl.innerHTML) {
+            existing.innerHTML = newEl.innerHTML;
+            existing.className = newEl.className;
+          }
+        } else {
+          activityStreamEl.insertAdjacentHTML('beforeend', _renderMessageHtml(message));
+        }
+      }
       activityStreamEl.parentElement.scrollTop = activityStreamEl.parentElement.scrollHeight;
     }
 
