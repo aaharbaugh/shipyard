@@ -14,6 +14,8 @@ from typing import Any, Callable
 from .action_planner import PlanningCancelledError, plan_actions, plan_next_batch, replan_remaining_actions, request_exploration_files
 from .context_explorer import build_broad_context, load_context_files
 from .graph import build_graph, _check_file_syntax as _check_file_syntax_fast
+from .supervisor import plan_subtasks, should_use_supervisor
+from .worker_orchestrator import execute_workers
 from .intent_parser import parse_instruction
 from .langsmith_config import build_langgraph_config
 from .plan_feature import generate_spec_bundle
@@ -367,7 +369,30 @@ def run_once(
             action_plan["actions"] = actions
             print(f"[auto-test] appended: {test_cmd}", flush=True)
 
-        result = _run_action_plan(app, state, action_plan, progress_callback)
+        # Multi-agent: if the task is complex, decompose into parallel workers
+        if should_use_supervisor(state):
+            _emit_progress(progress_callback, "supervisor", {"instruction": state.get("instruction")})
+            print("[supervisor] decomposing into sub-tasks...", flush=True)
+            supervisor_plan = plan_subtasks(state)
+            subtasks = supervisor_plan.get("subtasks") or []
+            if len(subtasks) > 1:
+                print(f"[supervisor] {len(subtasks)} workers: {', '.join(t['id'] for t in subtasks)}", flush=True)
+                _emit_progress(progress_callback, "multi_agent", {
+                    "worker_count": len(subtasks),
+                    "workers": [{"id": t["id"], "scope": t.get("scope"), "instruction": t.get("instruction", "")[:80]} for t in subtasks],
+                })
+                result = execute_workers(
+                    state, subtasks, _run_action_plan,
+                    progress_callback=progress_callback,
+                )
+                result["supervisor_plan"] = supervisor_plan
+                result["action_plan"] = action_plan  # keep original plan for reference
+            else:
+                # Supervisor decided single-agent is fine
+                print("[supervisor] single worker sufficient", flush=True)
+                result = _run_action_plan(app, state, action_plan, progress_callback)
+        else:
+            result = _run_action_plan(app, state, action_plan, progress_callback)
         # Chunked planning: if the LLM indicated more batches are needed, keep planning
         # and executing with full context of what was done so far.
         batch_limit = 8  # guard against runaway chunked plans
