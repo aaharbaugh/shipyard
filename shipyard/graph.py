@@ -485,20 +485,24 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
             "Preserve all existing content — only change what the instruction asks for."
         )
 
-    # Auto-downgrade write_file → append for purely additive changes on valid files.
-    # This prevents the LLM from nuking existing content when it only needs to add.
-    instruction_lower = (state.get("instruction") or "").lower()
-    _additive_signals = ("add ", "add a ", "append", "insert", "include a ", "create a new ")
-    _is_additive = any(instruction_lower.startswith(s) or f" {s}" in instruction_lower for s in _additive_signals)
+    # Block write_file on valid existing files — force search_and_replace instead.
+    # write_file is fundamentally destructive: the LLM must regenerate the entire file
+    # from its context window, and it WILL drop content it doesn't think is relevant.
+    # search_and_replace can only change what it matches, so it can't nuke anything.
     if (
         planned_mode == "write_file"
         and not syntax_err
-        and _is_additive
         and current_file_before
-        and file_line_count > 20
+        and file_line_count > 10
     ):
-        planned_mode = "append"
-        hint = "Add ONLY the new content. The runtime will append it to the existing file."
+        planned_mode = "search_and_replace"
+        hint = (
+            "Use search_and_replace mode. Set anchor to the EXACT text you want to change "
+            "(copy it verbatim from the current file), and replacement to the new text. "
+            "Only the matched text will be replaced — all other content is preserved. "
+            "If you need to add new content, set anchor to the line AFTER which you want to insert, "
+            "and include that line plus the new content in replacement."
+        )
 
     context["helper_notes"] = f"{context.get('helper_notes', '')}\n{hint}".strip()
     seeded_state = {
@@ -524,15 +528,12 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     planned["provider_reason"] = (
         f"{planned.get('provider_reason') or ''} Refined from the current file/tool context."
     ).strip()
-    # Preserve the planned edit_mode: the LLM in propose_edit sometimes switches
-    # modes (e.g. write_file → anchor) which breaks the deferred-content pattern.
-    preplanned_mode = preplanned.get("edit_mode")
-    if preplanned_mode == "write_file" and planned.get("edit_mode") != "write_file":
-        planned["edit_mode"] = "write_file"
-        # If the LLM returned anchor+replacement, use the replacement as write_file content
-        if planned.get("replacement") is not None:
-            planned["anchor"] = None
-            planned["pointers"] = None
+    # Preserve the downgraded edit_mode: if we forced search_and_replace above,
+    # make sure the LLM's proposal respects it. Don't let it switch back to write_file.
+    if planned_mode == "search_and_replace" and planned.get("edit_mode") == "write_file":
+        # LLM tried to use write_file but we need search_and_replace.
+        # Convert: use the replacement as-is but switch mode.
+        planned["edit_mode"] = "search_and_replace"
         # Re-validate after mode correction
         from .proposal_validation import validate_proposal as _revalidate
         errors = _revalidate(planned)
@@ -1550,6 +1551,20 @@ def apply_edit(state: ShipyardState) -> dict:
         updated_content = current_content
 
         if state.get("edit_mode") == "write_file":
+            # Safety: block write_file if it would lose >30% of existing content.
+            # This catches the LLM regenerating a stripped-down version of the file.
+            if current_content and len(replacement) < len(current_content) * 0.7:
+                lost_pct = round((1 - len(replacement) / len(current_content)) * 100)
+                return {
+                    "edit_applied": False,
+                    "edit_attempts": edit_attempts,
+                    "status": "edit_blocked",
+                    "error": (
+                        f"write_file would lose ~{lost_pct}% of existing content "
+                        f"({len(current_content)} → {len(replacement)} chars). "
+                        "Use search_and_replace to make targeted changes instead."
+                    ),
+                }
             updated_content = replacement
         elif state.get("edit_mode") == "append":
             updated_content = current_content + replacement

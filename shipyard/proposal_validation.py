@@ -225,9 +225,10 @@ def validate_proposal(proposal: dict[str, Any]) -> list[str]:
             errors.append("search_and_replace mode requires intent=localized_edit.")
         if edit_scope and edit_scope not in {"single_span", "multi_span"}:
             errors.append("search_and_replace mode requires edit_scope=single_span or multi_span.")
-        if not proposal.get("pattern") and not anchor:
+        has_dependencies = bool(proposal.get("depends_on") or proposal.get("inputs_from"))
+        if not proposal.get("pattern") and not anchor and not has_dependencies:
             errors.append("search_and_replace mode requires pattern or anchor.")
-        if replacement is None:
+        if replacement is None and not has_dependencies:
             errors.append("search_and_replace mode requires replacement.")
         elif (proposal.get("pattern") and str(proposal.get("pattern")) == str(replacement)) or (anchor and str(anchor) == str(replacement)):
             errors.append("search_and_replace replacement must differ from the search text.")

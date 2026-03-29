@@ -199,11 +199,25 @@ def _auto_branch(state: ShipyardState) -> dict[str, str] | None:
 
 
 def _auto_rollback(state: ShipyardState, result: ShipyardState) -> ShipyardState:
-    """If the run failed, revert all changed files using snapshots."""
+    """If the run failed due to an EDIT failure, revert changed files.
+
+    Does NOT rollback if edits succeeded but a verify/test step failed —
+    the edits are likely correct, the test just timed out or found a pre-existing issue.
+    """
     status = result.get("status", "")
     if status in ("edited", "verified", "observed", "completed"):
         return result  # success — keep changes
-    changed = result.get("changed_files") or []
+
+    # Check if any edit step actually succeeded — if so, keep the edits
+    steps = result.get("action_steps") or []
+    has_successful_edit = any(
+        s.get("action_class") == "mutate" and s.get("status") in ("edited", "verified")
+        for s in steps
+    )
+    if has_successful_edit:
+        # Edits worked, only a verify/test step failed — don't rollback
+        return result
+
     transactions = result.get("file_transactions") or []
     if not transactions:
         return result
