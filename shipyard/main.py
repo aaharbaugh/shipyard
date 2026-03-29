@@ -301,16 +301,22 @@ def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool
     _continuous_signals = ("all phases", "every phase", "all steps", "entire plan", "whole plan", "execute everything")
     if not any(signal in instruction for signal in _continuous_signals):
         return False
-    # Don't continue on hard failures (invalid plan, exception)
+    # Don't continue on hard failures (invalid plan, exception, cancelled)
     status = result.get("status", "")
     if status in ("invalid_action_plan", "cancelled"):
         return False
-    # Don't continue if nothing was created/edited (stuck)
+    # Don't continue if nothing was created/edited (stuck / plan complete)
     changed = result.get("changed_files") or []
     steps = result.get("action_steps") or []
-    had_work = bool(changed) or any(s.get("status") in ("edited", "verified") for s in steps)
+    had_work = bool(changed) or any(
+        s.get("status") in ("edited", "verified", "observed")
+        for s in steps
+    )
     if not had_work:
         return False
+    # Verify/test failures are non-fatal for continuous execution —
+    # the files were created, only the verify step failed (e.g. no pnpm install)
+    # So we keep going.
     # Cap at 20 iterations
     if state.get("_phase_iteration", 0) >= 20:
         return False
@@ -433,7 +439,10 @@ def run_once(
                 state["auto_branch"] = branch_result
 
         # Auto-test: discover project test runner and append a verify step
-        test_cmd = _discover_test_command(state)
+        # Skip auto-test if instruction says to skip verification/install/build
+        instruction_lower = (state.get("instruction") or "").lower()
+        _skip_verify = any(s in instruction_lower for s in ("skip install", "skip build", "skip verif", "skip test", "skip command"))
+        test_cmd = _discover_test_command(state) if not _skip_verify else None
         if test_cmd and has_mutate:
             actions = action_plan.get("actions") or []
             last_id = actions[-1].get("id", f"step-{len(actions)}") if actions else "step-0"
@@ -902,6 +911,15 @@ def _run_action_plan(
         })
 
         if step_status in {"edited", "verified", "observed", "edit_skipped"}:
+            completed_step_ids.add(step_id)
+            action_index += 1
+            continue
+
+        # Verify/test step failures are non-fatal — mark as completed and move on.
+        # The files were created/edited successfully, only the verify command failed
+        # (e.g. tsc without pnpm install, test suite not set up yet).
+        if action_class == "verify" and step_status in {"failed", "failed_after_retries"}:
+            print(f"  [{step_id}] verify failed (non-fatal) — continuing", flush=True)
             completed_step_ids.add(step_id)
             action_index += 1
             continue
