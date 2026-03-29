@@ -225,10 +225,16 @@ def _replan_mutate_step_from_current_file(state: ShipyardState, error: str) -> d
 
 
 def seed_defaults(state: ShipyardState) -> dict:
+    # Lock the target_path early — sandbox it and store as _locked_target_path.
+    # This prevents any downstream node (plan_edit, propose_edit) from overwriting
+    # it with a basename like "package.json" instead of "api/package.json".
+    target_path = state.get("target_path")
+    locked = _sandbox_target_path(target_path, state) if target_path else target_path
     return {
         "edit_attempts": state.get("edit_attempts", 0),
         "max_edit_attempts": state.get("max_edit_attempts", 2),
         "reverted_to_snapshot": False,
+        "_locked_target_path": locked or target_path,
     }
 
 
@@ -378,13 +384,15 @@ def plan_edit(state: ShipyardState) -> dict:
         "is_valid": planned.get("is_valid"),
         "validation_errors": planned.get("validation_errors", []),
     }
+    # Always prefer the locked target_path over whatever the LLM returned
+    _final_target = state.get("_locked_target_path") or planned.get("target_path") or state.get("target_path")
     proposal_summary = {
         "provider": planned.get("provider"),
         "provider_reason": planned.get("provider_reason"),
         "id": planned.get("id"),
         "action_class": planned.get("action_class"),
         "edit_mode": planned.get("edit_mode") or state.get("edit_mode") or "anchor",
-        "target_path": planned.get("target_path"),
+        "target_path": _final_target,
         "target_path_source": planned.get("target_path_source"),
         "pointers": planned.get("pointers"),
         "occurrence_selector": planned.get("occurrence_selector"),
@@ -405,7 +413,7 @@ def plan_edit(state: ShipyardState) -> dict:
     }
     return {
         "task_id": planned.get("id"),
-        "target_path": planned.get("target_path"),
+        "target_path": _final_target,
         "anchor": planned.get("anchor"),
         "replacement": planned.get("replacement"),
         "pointers": planned.get("pointers"),
@@ -726,14 +734,16 @@ def _sandbox_target_path(target_path: str | None, state: ShipyardState) -> str |
 
 def apply_edit(state: ShipyardState) -> dict:
     edit_mode = state.get("edit_mode") or ""
-    target_path = state.get("target_path")
+    # ALWAYS use the locked target_path from seed_defaults — this is the
+    # sandboxed path that was set before any LLM could mangle it.
+    target_path = state.get("_locked_target_path") or state.get("target_path")
 
-    # Sandbox relative paths to session workspace for mutation modes
+    # Sandbox as fallback if _locked_target_path wasn't set
     if edit_mode in _FILE_REQUIRED_MODES and target_path:
         sandboxed = _sandbox_target_path(target_path, state)
         if sandboxed and sandboxed != target_path:
             target_path = sandboxed
-            state = {**state, "target_path": target_path}
+    state = {**state, "target_path": target_path}
 
     if edit_mode in _FILE_REQUIRED_MODES and target_path:
         tp = Path(str(target_path))
