@@ -528,7 +528,9 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
         "context": context,
     }
     planned = propose_edit(seeded_state)
-    planned.setdefault("target_path", preplanned.get("target_path"))
+    # Always preserve the preplanned target_path — the LLM's proposal may return
+    # just a basename ("index.ts") instead of the full path ("api/src/modules/auth/index.ts")
+    planned["target_path"] = target_path or preplanned.get("target_path")
     planned.setdefault("target_path_source", preplanned.get("target_path_source"))
     planned.setdefault("provider", state.get("action_plan", {}).get("provider"))
     planned["provider_reason"] = (
