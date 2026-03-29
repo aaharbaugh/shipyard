@@ -1,94 +1,89 @@
 # AI Development Log
 
-## Architecture Overview
+## Tools & Workflow
 
-Shipyard is an LLM-powered coding agent built on LangGraph. It takes natural-language instructions,
-plans a sequence of inspect/edit/verify actions, and executes them against a sandboxed workspace.
+**Primary AI tools used:**
+- **Claude Code (CLI)** — primary development partner for all Shipyard code. Used for architecture design, implementation, debugging, and documentation. Every file in the agent was written or reviewed through Claude Code conversations.
+- **OpenAI GPT-5.4-mini** — the LLM powering the agent itself. Handles action planning, edit proposal generation, and task decomposition at runtime.
+- **OpenAI GPT-4.1-nano** — cheaper model used at runtime for low-stakes calls: plan repair, adaptive replan, file exploration.
+- **LangSmith** — tracing and observability for LangGraph execution (configured via environment variables).
 
-### Core Pipeline
+**Workflow:**
+1. Describe the desired behavior or bug to Claude Code
+2. Claude reads the codebase, proposes changes, implements them
+3. Run `python -m pytest tests/ -x -q` to verify
+4. Test end-to-end with `echo '{"instruction": "...", "session_id": "..."}' | python -m shipyard.main`
+5. Iterate on failures — Claude reads traces, diagnoses, fixes
 
+## Effective Prompts
+
+### Prompt 1: Architecture simplification
 ```
-instruction -> plan_actions -> [for each step: fetch_step_context -> plan_edit -> validate -> apply_edit -> verify -> recover_or_finish]
+The professor says the agent is over-engineered. Fix three things:
+1. Simplify the editing approach — use inspect-first (grep/cat/run_command),
+   then write_file or search_and_replace. Remove anchor-with-pointers complexity.
+2. Replace Code Graph RAG with simple grep+cat.
+3. Add required docs (trace links, AI Development Log).
 ```
+This prompt drove the biggest architectural change — removing Code Graph RAG dependency, simplifying edit modes, and establishing the inspect-first pattern.
 
-### Key Design Decisions
-
-#### Inspect-First Pattern (2026-03)
-The agent enforces an **inspect-first** approach: before editing any existing file, the plan must
-include a `read_file` or `run_command` step to see the current file state. This prevents the LLM
-from generating stale anchors or blind rewrites.
-
-- **Why**: Anchor edits generated without seeing the file fail when the file has duplicates, syntax
-  errors, or has changed since the instruction was written.
-- **Trace**: `action_planner.py:_build_action_plan_prompt` contains the INSPECT-FIRST RULE section.
-
-#### Simplified Edit Modes (2026-03)
-Primary edit modes are:
-1. `write_file` -- full file rewrite, best for small/broken files
-2. `search_and_replace` -- exact text find-and-replace, best for targeted changes
-3. `append` / `prepend` -- add content to file boundaries
-
-Legacy modes (`anchor` with pointers, `named_function`) are still supported but no longer
-recommended in planning prompts. The `named_function` mode auto-degrades to `write_file`.
-
-- **Why**: Anchor-with-pointers is fragile (character offsets drift). Named-function requires
-  Code Graph RAG (Memgraph) which is often unavailable.
-- **Trace**: `prompts.py:build_proposal_prompt`, `graph.py:check_edit_readiness`
-
-#### Code Graph RAG Removed as Hard Dependency (2026-03)
-The agent no longer requires Memgraph/Code Graph RAG for `named_function` edits. Instead:
-- `check_edit_readiness` degrades `named_function` to `write_file` automatically
-- `collect_edit_context` attempts grep-based function extraction, falls back to full file contents
-- The LLM uses the file contents (loaded by `fetch_step_context`) to generate edits
-
-This follows the "grep + cat" principle: simple tools are more robust than complex RAG pipelines.
-
-- **Trace**: `graph.py:check_edit_readiness`, `graph.py:collect_edit_context`
-
-#### Pre-Planning Syntax Detection (2026-03)
-Before `plan_actions` runs, the runtime scans workspace files for syntax errors and injects a
-WARNING into the planning context. This ensures the LLM knows to use `write_file` for broken files.
-
-- **Trace**: `main.py:_detect_workspace_syntax_errors`
-
-#### Workspace Path Sandboxing (2026-03)
-Relative paths like `app.js` from the LLM are resolved against the session workspace
-(`.shipyard/data/workspace/default/`) instead of CWD. This prevents writes to the wrong directory.
-
-- **Why**: The LLM returns bare filenames; without sandboxing, `Path("app.js")` resolves to the
-  project root instead of the agent's managed workspace.
-- **Trace**: `graph.py:_sandbox_target_path`, applied in `fetch_step_context` and `apply_edit`
-
-#### Parallel Batch Execution (2026-03)
-Independent actions targeting different files are detected and executed concurrently using
-`ThreadPoolExecutor`. The batch detector groups consecutive actions that share the same
-`action_class`, target different files, and have no cross-dependencies.
-
-- **Why**: Multi-file edits (e.g., editing `app.js`, `index.html`, `styles.css` simultaneously)
-  complete faster when parallelized. The LLM planner generates inspect-first plans with
-  3 reads followed by 3 writes — both groups run as parallel batches.
-- **Trace**: `main.py:_find_parallel_batch`, `main.py:_execute_batch_parallel`
-
-### Trace Links
-
-| Component | File | Key Function |
-|-----------|------|-------------|
-| Action planning | `shipyard/action_planner.py` | `plan_actions`, `_build_action_plan_prompt` |
-| Proposal generation | `shipyard/prompts.py` | `build_proposal_prompt`, `build_runtime_prompt` |
-| Graph nodes | `shipyard/graph.py` | `check_edit_readiness`, `collect_edit_context`, `apply_edit`, `recover_or_finish` |
-| Proposal validation | `shipyard/proposal_validation.py` | `validate_proposal` |
-| Syntax detection | `shipyard/main.py` | `_detect_workspace_syntax_errors` |
-| Workspace management | `shipyard/workspaces.py` | `get_session_workspace` |
-| Context exploration | `shipyard/context_explorer.py` | `build_broad_context`, `detect_project_stack` |
-| Path sandboxing | `shipyard/graph.py` | `_sandbox_target_path` |
-| Parallel execution | `shipyard/main.py` | `_find_parallel_batch`, `_execute_batch_parallel` |
-| Inspect-first check | `shipyard/action_plan_validation.py` | `check_inspect_first` |
-
-### Testing
-
-Run all tests:
-```bash
-python -m pytest tests/ -x -q
+### Prompt 2: Content preservation debugging
 ```
+I'm giving it specific tasks and it's removing several other features in the
+pass through.
+```
+Short but effective — led to the discovery that write_file fundamentally can't preserve content on large files, which led to the search_and_replace-first strategy and the 30% content loss guard.
 
-Tests cover: action planning, graph flow, proposal validation, pathing, workspaces, and the main run loop.
+### Prompt 3: Reliability audit
+```
+I need you to think that you might get very open ended tasks. We just need to
+guard from malicious code but other than that you need to go ham on this bitch.
+```
+Triggered removal of 17 human_gate blocks, relaxation of shell command restrictions, and the shift from "ask permission" to "fail and move on" philosophy.
+
+### Prompt 4: Multi-agent design
+```
+I want a solid version of multi-agent. Supervisor that decomposes, workers that
+execute in parallel, conflict detection.
+```
+Led to the supervisor + worker orchestrator architecture with dependency waves and conflict detection.
+
+### Prompt 5: Ship repo integration
+```
+Run through the scenario where I actually run this on the SHIP app.
+```
+Uncovered the workspace binding bug, path sandboxing gaps, filename false positives (console.log), and the workspace clobbering issue.
+
+## Code Analysis
+
+**AI-generated vs hand-written code:**
+- ~95% AI-generated (Claude Code wrote all implementation code)
+- ~5% hand-directed (specific architectural decisions, prompt wording, test scenarios)
+
+The human role was primarily: defining what to build, identifying failure modes, testing end-to-end, and pushing back when the agent over-engineered solutions.
+
+## Strengths & Limitations
+
+**Where AI excelled:**
+- Rapid prototyping: entire supervisor + worker orchestrator (~536 lines) built in one session
+- Bug tracing: Claude could read trace files, identify root causes (e.g., `list("s1")` → `["s", "1"]`), and fix them immediately
+- Test generation: 231 tests covering edge cases the human wouldn't have thought of
+- Cross-file consistency: updating prompts, validation, graph nodes, and tests in one pass
+
+**Where AI fell short:**
+- Over-engineering: initial designs had too many modes, too many gates, too many abstractions. Required explicit "simplify" pushback.
+- Content preservation: the LLM consistently drops content when rewriting files. No amount of prompt engineering fixed this — needed a structural guard (content loss check).
+- Path resolution: the sandbox logic had subtle bugs that only surfaced when testing against a real external repo. AI didn't anticipate these edge cases.
+- False confidence: "verify: 1 passed" was reported even when the file hadn't actually changed, because the verification ran on unchanged content.
+
+## Key Learnings
+
+1. **Structural guards beat prompt engineering.** Telling the LLM "preserve all content" doesn't work. Blocking write_file when it would lose >30% content does.
+
+2. **The LLM is smarter than the validator.** We removed multiple validation rules (step count heuristic, strict enum checking, human gates) because they blocked reasonable LLM output. The agent got more reliable by removing code, not adding it.
+
+3. **Test against real repos early.** The todo app sandbox hid path resolution bugs, workspace binding issues, and timeout problems that only surfaced on the 116K-line ship monorepo.
+
+4. **Model tiering saves money without losing quality.** Using nano for repair/replan/exploration cut costs ~70% on those calls with no quality impact.
+
+5. **Multi-agent is mostly an orchestration problem.** The hard part isn't running workers in parallel — it's deciding what to parallelize and merging results without conflicts.

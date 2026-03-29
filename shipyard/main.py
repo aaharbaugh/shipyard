@@ -294,6 +294,48 @@ def _discover_test_command(state: ShipyardState) -> str | None:
         return None
 
 
+_REBUILD_LOG_PATH = Path(".shipyard/data/rebuild_log.jsonl")
+
+
+def _log_rebuild_entry(state: ShipyardState, result: ShipyardState) -> None:
+    """Append a structured entry to the rebuild log for every run.
+
+    Captures instruction, status, changed files, errors, timing, and whether
+    the run required human intervention (based on status).
+    """
+    try:
+        _REBUILD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        status = result.get("status", "unknown")
+        changed = result.get("changed_files") or []
+        steps = result.get("action_steps") or []
+        failed_steps = [s for s in steps if s.get("status") in ("failed", "failed_after_retries", "edit_blocked", "invalid_proposal")]
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "session_id": state.get("session_id"),
+            "instruction": (state.get("instruction") or "")[:200],
+            "status": status,
+            "changed_files": [Path(f).name for f in changed],
+            "changed_count": len(changed),
+            "step_count": len(steps),
+            "failed_steps": [
+                {"id": s.get("id"), "mode": s.get("edit_mode"), "error": str(s.get("error", ""))[:150]}
+                for s in failed_steps
+            ],
+            "error": str(result.get("error") or "")[:200],
+            "multi_agent": bool(result.get("multi_agent")),
+            "worker_count": result.get("worker_count", 0),
+            "auto_branch": bool(result.get("auto_branch")),
+            "auto_rollback": bool(result.get("auto_rollback")),
+            "diff_chars": len(result.get("diff") or ""),
+            "trace_path": result.get("trace_path"),
+            "needs_intervention": status in ("invalid_action_plan", "invalid_proposal", "blocked", "needs_approval"),
+        }
+        with open(_REBUILD_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # never break a run for logging
+
+
 def run_once(
     app,
     session_store: SessionStore,
@@ -354,6 +396,7 @@ def run_once(
         if not action_plan.get("is_valid", True):
             result = _invalid_action_plan_result(state, action_plan)
             result = _persist_result(session_store, result)
+            _log_rebuild_entry(state, result)
             _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
             return result
         # Auto-branch: create a feature branch before any edits touch files
@@ -463,6 +506,7 @@ def run_once(
 
         result = _attach_file_outcome(result)
         result = _persist_result(session_store, result)
+        _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
         return result
     except PlanningCancelledError:
@@ -472,11 +516,13 @@ def run_once(
             "error": "Run cancelled.",
         }
         result = _persist_result(session_store, result)
+        _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
         return result
     except Exception as exc:
         result = _failed_runtime_result(state, str(exc), action_plan=action_plan)
         result = _persist_result(session_store, result)
+        _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path"), "error": result.get("error")})
         return result
 
