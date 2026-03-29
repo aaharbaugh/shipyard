@@ -724,14 +724,22 @@ def _sandbox_target_path(target_path: str | None, state: ShipyardState) -> str |
     if not session_id:
         return target_path  # no session — bare unit tests
     workspace = get_session_workspace(session_id).resolve()
+    repo_root = Path.cwd().resolve()
+    # If workspace is external (not inside CWD), always sandbox there
+    # This handles the rebuild case: workspace=/ship-rebuild, CWD=/shipyard
+    try:
+        workspace.relative_to(repo_root)
+        is_external = False
+    except ValueError:
+        is_external = True
+    if is_external:
+        return str((workspace / tp).resolve())
+    # For internal workspaces, prefer workspace if file exists there
     sandboxed = (workspace / tp).resolve()
-    # Only sandbox if the relative path doesn't already exist at CWD
-    # AND it exists (or its parent exists) inside the workspace.
-    cwd_path = (Path.cwd() / tp).resolve()
-    if sandboxed.exists() or (sandboxed.parent.exists() and not cwd_path.exists()):
+    if sandboxed.exists():
         return str(sandboxed)
-    # If both exist, prefer workspace
-    if sandboxed.exists() and cwd_path.exists():
+    # For new files in managed workspace, sandbox if parent exists there
+    if sandboxed.parent.exists():
         return str(sandboxed)
     return target_path
 
@@ -1259,15 +1267,11 @@ def apply_edit(state: ShipyardState) -> dict:
 
         created_files = []
         for file_spec in files:
-            resolved_path, _ = resolve_target_path(
-                str(file_spec.get("path") or ""),
-                state.get("context", {}) or {},
-                "write_file",
-                session_id=state.get("session_id"),
-                instruction=str(file_spec.get("path") or ""),
-            )
-            if not resolved_path:
+            raw_path = str(file_spec.get("path") or "")
+            if not raw_path:
                 continue
+            # Use sandbox to resolve relative paths to workspace
+            resolved_path = _sandbox_target_path(raw_path, state) or raw_path
             file_path = Path(resolved_path)
             if file_path.exists():
                 return {
