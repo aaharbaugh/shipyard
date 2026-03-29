@@ -495,20 +495,7 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
             "Preserve all existing content — only change what the instruction asks for."
         )
 
-    # Guide write_file on valid existing files: prefer search_and_replace via hints.
-    # The 30% content loss guard in apply_edit is the hard safety net — if the LLM
-    # uses write_file and drops too much content, it gets blocked there.
-    if (
-        planned_mode == "write_file"
-        and not syntax_err
-        and current_file_before
-        and file_line_count > 10
-    ):
-        hint += (
-            "\nPrefer search_and_replace over write_file for targeted changes. "
-            "Set anchor to the EXACT text to change (verbatim from the file) and replacement to the new text. "
-            "write_file will be blocked if it loses >30% of existing content."
-        )
+    # No content loss guard — let write_file do its job.
 
     context["helper_notes"] = f"{context.get('helper_notes', '')}\n{hint}".strip()
     seeded_state = {
@@ -1543,20 +1530,6 @@ def apply_edit(state: ShipyardState) -> dict:
         updated_content = current_content
 
         if state.get("edit_mode") == "write_file":
-            # Safety: block write_file if it would lose >30% of existing content.
-            # This catches the LLM regenerating a stripped-down version of the file.
-            if current_content and len(replacement) < len(current_content) * 0.7:
-                lost_pct = round((1 - len(replacement) / len(current_content)) * 100)
-                return {
-                    "edit_applied": False,
-                    "edit_attempts": edit_attempts,
-                    "status": "edit_blocked",
-                    "error": (
-                        f"write_file would lose ~{lost_pct}% of existing content "
-                        f"({len(current_content)} → {len(replacement)} chars). "
-                        "Use search_and_replace to make targeted changes instead."
-                    ),
-                }
             updated_content = replacement
         elif state.get("edit_mode") == "append":
             updated_content = current_content + replacement
