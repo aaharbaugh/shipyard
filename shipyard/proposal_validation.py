@@ -141,12 +141,11 @@ def validate_proposal(proposal: dict[str, Any]) -> list[str]:
                 errors.append("prepend mode requires intent=prepend_content.")
             if edit_scope and edit_scope != "file_head":
                 errors.append("prepend mode requires edit_scope=file_head.")
-        # Allow deferred content when the step depends on inspect steps (inspect-first pattern).
-        # The runtime's _refine_preplanned_action will fill in replacement after reading the file.
-        has_dependencies = bool(proposal.get("depends_on") or proposal.get("inputs_from"))
-        if replacement is None and not has_dependencies:
-            errors.append(f"{edit_mode} mode requires replacement content.")
-        elif replacement is not None and _looks_like_placeholder_replacement(replacement):
+        # Content validation: only reject obvious placeholder content.
+        # Missing replacement (None) is allowed — the runtime handles it:
+        # - apply_edit returns awaiting_edit_spec if truly missing
+        # - _refine_preplanned_action fills it from LLM during plan_edit
+        if replacement is not None and _looks_like_placeholder_replacement(replacement):
             errors.append(f"{edit_mode} mode requires actual content, not a placeholder.")
         # full_file_rewrite is advisory metadata — write_file mode already implies a full
         # rewrite, so the LLM not setting this flag should not block execution.
@@ -226,11 +225,10 @@ def validate_proposal(proposal: dict[str, Any]) -> list[str]:
             errors.append("search_and_replace mode requires intent=localized_edit.")
         if edit_scope and edit_scope not in {"single_span", "multi_span"}:
             errors.append("search_and_replace mode requires edit_scope=single_span or multi_span.")
-        has_dependencies = bool(proposal.get("depends_on") or proposal.get("inputs_from"))
-        if not proposal.get("pattern") and not anchor and not has_dependencies:
-            errors.append("search_and_replace mode requires pattern or anchor.")
-        if replacement is None and not has_dependencies:
-            errors.append("search_and_replace mode requires replacement.")
+        if not proposal.get("pattern") and not anchor:
+            # Missing anchor is OK — the runtime refinement will fill it from live file content
+            pass
+        # Missing replacement is OK — runtime handles it via refinement or awaiting_edit_spec
         elif (proposal.get("pattern") and str(proposal.get("pattern")) == str(replacement)) or (anchor and str(anchor) == str(replacement)):
             errors.append("search_and_replace replacement must differ from the search text.")
         elif _looks_like_placeholder_replacement(replacement):
