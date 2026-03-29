@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import re
 import uuid
 import copy
 import hashlib
@@ -23,7 +24,7 @@ from .session_store import SessionStore
 from .state import ShipyardState
 from .tools.code_graph import inspect_code_graph_status, sync_live_code_graph
 from .tracing import write_trace, write_troubleshooting_log
-from .workspaces import set_session_workspace
+from .workspaces import get_session_workspace, set_session_workspace
 
 
 def _detect_workspace_syntax_errors(session_id: str | None) -> dict[str, str]:
@@ -171,6 +172,112 @@ def _coerce_optional_str(value: Any) -> str | None:
     return str(value)
 
 
+def _auto_branch(state: ShipyardState) -> dict[str, str] | None:
+    """Create a feature branch before edits so damage stays off main."""
+    try:
+        from .tools.git_tools import GitAutomation
+        workspace = get_session_workspace(state.get("session_id"))
+        git = GitAutomation(str(workspace))
+        status = git.get_status()
+        branch = status.get("branch", "")
+        # Only branch if we're on main/master — don't nest branches
+        if branch not in ("main", "master"):
+            return None
+        # Slug from instruction
+        instruction = state.get("instruction", "")[:40].strip()
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", instruction).strip("-").lower() or "shipyard"
+        ts = time.strftime("%m%d-%H%M")
+        branch_name = f"shipyard/{slug}-{ts}"
+        result = git.create_branch(branch_name)
+        print(f"[auto-branch] {result.get('action', '?')} → {branch_name}", flush=True)
+        return result
+    except Exception as exc:
+        print(f"[auto-branch] skipped: {exc}", flush=True)
+        return None
+
+
+def _auto_rollback(state: ShipyardState, result: ShipyardState) -> ShipyardState:
+    """If the run failed, revert all changed files using snapshots."""
+    status = result.get("status", "")
+    if status in ("edited", "verified", "observed", "completed"):
+        return result  # success — keep changes
+    changed = result.get("changed_files") or []
+    transactions = result.get("file_transactions") or []
+    if not transactions:
+        return result
+    reverted: list[str] = []
+    for tx in transactions:
+        snap = tx.get("snapshot_path")
+        target = tx.get("target_path")
+        if snap and target and Path(str(snap)).exists() and Path(str(target)).exists():
+            try:
+                from .tools.revert import revert_file
+                revert_file(str(target), str(snap))
+                reverted.append(str(target))
+            except Exception:
+                pass
+    if reverted:
+        print(f"[auto-rollback] reverted {len(reverted)} file(s): {', '.join(Path(p).name for p in reverted)}", flush=True)
+        result["auto_rollback"] = {"reverted": reverted, "reason": status}
+    return result
+
+
+def _collect_diffs(result: ShipyardState) -> str:
+    """Generate unified diffs for all changed files vs their snapshots."""
+    import difflib
+    transactions = result.get("file_transactions") or []
+    diffs: list[str] = []
+    for tx in transactions:
+        snap = tx.get("snapshot_path")
+        target = tx.get("target_path")
+        if not snap or not target:
+            continue
+        try:
+            before = Path(str(snap)).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True) if Path(str(snap)).exists() else []
+            after = Path(str(target)).read_text(encoding="utf-8", errors="replace").splitlines(keepends=True) if Path(str(target)).exists() else []
+            name = Path(str(target)).name
+            diff = difflib.unified_diff(before, after, fromfile=f"a/{name}", tofile=f"b/{name}")
+            diff_text = "".join(diff)
+            if diff_text:
+                diffs.append(diff_text)
+        except Exception:
+            continue
+    return "\n".join(diffs)
+
+
+def _discover_test_command(state: ShipyardState) -> str | None:
+    """Auto-detect the project's test runner from config files."""
+    try:
+        workspace = get_session_workspace(state.get("session_id"))
+        # Check package.json scripts
+        pkg = workspace / "package.json"
+        if pkg.exists():
+            import json as _json
+            data = _json.loads(pkg.read_text())
+            scripts = data.get("scripts", {})
+            # Prefer test, then test:unit, then check
+            for key in ("test", "test:unit", "check", "lint"):
+                if key in scripts:
+                    # Detect package manager
+                    if (workspace / "pnpm-lock.yaml").exists():
+                        return f"pnpm {key}"
+                    if (workspace / "yarn.lock").exists():
+                        return f"yarn {key}"
+                    return f"npm run {key}"
+        # Check pyproject.toml
+        pyproject = workspace / "pyproject.toml"
+        if pyproject.exists():
+            content = pyproject.read_text()
+            if "pytest" in content:
+                return "python -m pytest -x -q"
+        # Check for pytest directly
+        if (workspace / "tests").is_dir() or (workspace / "test").is_dir():
+            return "python -m pytest -x -q"
+        return None
+    except Exception:
+        return None
+
+
 def run_once(
     app,
     session_store: SessionStore,
@@ -233,6 +340,33 @@ def run_once(
             result = _persist_result(session_store, result)
             _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
             return result
+        # Auto-branch: create a feature branch before any edits touch files
+        has_mutate = any(
+            (a.get("action_class") or "") == "mutate"
+            for a in (action_plan.get("actions") or [])
+        )
+        if has_mutate:
+            branch_result = _auto_branch(state)
+            if branch_result:
+                state["auto_branch"] = branch_result
+
+        # Auto-test: discover project test runner and append a verify step
+        test_cmd = _discover_test_command(state)
+        if test_cmd and has_mutate:
+            actions = action_plan.get("actions") or []
+            last_id = actions[-1].get("id", f"step-{len(actions)}") if actions else "step-0"
+            actions.append({
+                "id": f"auto-test",
+                "instruction": f"Run project tests: {test_cmd}",
+                "action_class": "verify",
+                "edit_mode": "run_command",
+                "command": test_cmd,
+                "depends_on": [last_id],
+                "timeout_seconds": 120,
+            })
+            action_plan["actions"] = actions
+            print(f"[auto-test] appended: {test_cmd}", flush=True)
+
         result = _run_action_plan(app, state, action_plan, progress_callback)
         # Chunked planning: if the LLM indicated more batches are needed, keep planning
         # and executing with full context of what was done so far.
@@ -275,6 +409,19 @@ def run_once(
             result["graph_sync"] = graph_sync
             if graph_sync.get("status"):
                 result["code_graph_status"] = graph_sync["status"]
+        # Collect unified diffs for audit
+        diff_text = _collect_diffs(result)
+        if diff_text:
+            result["diff"] = diff_text
+            print(f"[diff] {len(diff_text)} chars across {diff_text.count('--- a/')} file(s)", flush=True)
+
+        # Auto-rollback: if run failed, revert all changes
+        result = _auto_rollback(state, result)
+
+        # Copy branch info to result
+        if state.get("auto_branch"):
+            result["auto_branch"] = state["auto_branch"]
+
         result = _attach_file_outcome(result)
         result = _persist_result(session_store, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
