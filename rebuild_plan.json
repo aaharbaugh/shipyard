@@ -1,0 +1,50 @@
+[
+  {
+    "phase": "scaffold",
+    "instruction": "Create a pnpm monorepo. Create these files: pnpm-workspace.yaml (packages: api, web, shared), package.json (name: ship-rebuild, private: true, packageManager: pnpm@10.27.0, scripts: {dev: pnpm --parallel run dev, build: pnpm --recursive run build}), tsconfig.json (base config with strict, ES2022, node module resolution). Create three package directories: api/, web/, shared/ each with their own package.json and tsconfig.json. api uses express + typescript + @types/express + pg + bcryptjs + cors + helmet + express-session. web uses react + react-dom + react-router + @tanstack/react-query + vite + @vitejs/plugin-react + typescript + tailwindcss + autoprefixer + postcss. shared has no dependencies, just typescript."
+  },
+  {
+    "phase": "shared-types",
+    "instruction": "In shared/src/types/index.ts create and export these TypeScript interfaces: User {id: string, email: string, name: string, role: 'admin' | 'member', createdAt: string}, Workspace {id: string, name: string, description: string, ownerId: string, createdAt: string, updatedAt: string}, Document {id: string, title: string, content: string, workspaceId: string, createdBy: string, createdAt: string, updatedAt: string}, ApiResponse<T> {data?: T, error?: string, status: number}. Create shared/src/index.ts that re-exports everything from types."
+  },
+  {
+    "phase": "api-setup",
+    "instruction": "In api/src/index.ts create an Express server that: imports express, cors, helmet, express-session; uses JSON body parser, CORS (origin: http://localhost:5173, credentials: true), helmet, session (secret from env, resave false, saveUninitialized false); listens on PORT env or 3001; has a GET /api/health endpoint returning {status: 'ok'}. Create api/src/db.ts with a pg Pool using DATABASE_URL env variable and a query helper function."
+  },
+  {
+    "phase": "api-auth",
+    "instruction": "Create api/src/routes/auth.ts with Express router. POST /login: validate email+password from body, query users table, bcrypt.compare password, set req.session.userId, return user without password. POST /register: validate email+password+name, hash password with bcrypt, insert into users table, set session, return user. POST /logout: destroy session, return success. GET /me: check session.userId, query user, return user or 401. Create api/src/middleware/auth.ts with authMiddleware that checks session.userId and returns 401 if missing. Wire auth routes into the main Express app."
+  },
+  {
+    "phase": "api-workspaces",
+    "instruction": "Create api/src/routes/workspaces.ts with Express router, all routes behind authMiddleware. GET / : list workspaces where owner_id = session userId. POST / : create workspace with name and description, set owner_id from session. GET /:id : get workspace by id (verify owner). PUT /:id : update workspace name and description. DELETE /:id : delete workspace. Wire into main app at /api/workspaces."
+  },
+  {
+    "phase": "api-documents",
+    "instruction": "Create api/src/routes/documents.ts with Express router, all routes behind authMiddleware. GET /?workspaceId=X : list documents in workspace. POST / : create document with title, content, workspaceId, set created_by from session. GET /:id : get document by id. PUT /:id : update document title and content, set updated_at. DELETE /:id : delete document. Wire into main app at /api/documents."
+  },
+  {
+    "phase": "api-db-schema",
+    "instruction": "Create api/src/db/schema.sql with CREATE TABLE statements for: users (id UUID DEFAULT gen_random_uuid() PRIMARY KEY, email VARCHAR(255) UNIQUE NOT NULL, password_hash VARCHAR(255) NOT NULL, name VARCHAR(255) NOT NULL, role VARCHAR(50) DEFAULT 'member', created_at TIMESTAMPTZ DEFAULT NOW()), workspaces (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL, description TEXT DEFAULT '', owner_id UUID REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()), documents (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), title VARCHAR(255) NOT NULL, content TEXT DEFAULT '', workspace_id UUID REFERENCES workspaces(id) ON DELETE CASCADE, created_by UUID REFERENCES users(id), created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())."
+  },
+  {
+    "phase": "web-setup",
+    "instruction": "Set up the React frontend. Create web/index.html (standard Vite HTML with root div and script src /src/main.tsx). Create web/src/main.tsx (renders App inside React.StrictMode with BrowserRouter and QueryClientProvider). Create web/src/App.tsx with React Router routes: / -> redirect to /workspaces, /login -> LoginPage, /register -> RegisterPage, /workspaces -> WorkspacesPage (protected), /workspaces/:id -> WorkspaceDetailPage (protected), /documents/:id -> DocumentEditorPage (protected). Create web/vite.config.ts with react plugin and proxy /api to http://localhost:3001. Create web/tailwind.config.js and web/postcss.config.js. Create web/src/index.css with Tailwind directives."
+  },
+  {
+    "phase": "web-api-client",
+    "instruction": "Create web/src/lib/api.ts with a fetch wrapper: base URL from env or empty string, credentials: include, JSON content type. Export functions: login(email, password), register(email, password, name), logout(), getMe(), getWorkspaces(), createWorkspace(name, description), getWorkspace(id), updateWorkspace(id, data), deleteWorkspace(id), getDocuments(workspaceId), createDocument(title, content, workspaceId), getDocument(id), updateDocument(id, data), deleteDocument(id). Each function calls fetch and returns the JSON response."
+  },
+  {
+    "phase": "web-auth-pages",
+    "instruction": "Create web/src/pages/LoginPage.tsx: form with email and password inputs, submit calls api.login(), on success navigate to /workspaces, show error on failure. Styled with Tailwind (centered card, clean inputs). Create web/src/pages/RegisterPage.tsx: similar form with email, password, name fields. Create web/src/components/ProtectedRoute.tsx: uses useQuery to call getMe(), shows loading state, redirects to /login if 401, renders children if authenticated."
+  },
+  {
+    "phase": "web-workspace-pages",
+    "instruction": "Create web/src/pages/WorkspacesPage.tsx: uses useQuery(getWorkspaces), shows list of workspaces as cards with name and description, button to create new workspace (modal or inline form), click workspace navigates to /workspaces/:id. Create web/src/pages/WorkspaceDetailPage.tsx: shows workspace name, list of documents, button to create new document, click document navigates to /documents/:id. Styled with Tailwind."
+  },
+  {
+    "phase": "web-document-editor",
+    "instruction": "Create web/src/pages/DocumentEditorPage.tsx: loads document by id with useQuery, shows title input and a textarea for content, auto-saves on blur or after 2 seconds of no typing using useMutation(updateDocument). Show save status indicator. Back button to workspace. Styled with Tailwind - clean, minimal editor layout."
+  }
+]

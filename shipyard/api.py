@@ -2986,6 +2986,20 @@ def instruct(request: InstructionRequest) -> dict[str, Any]:
     return run_once(graph_app, session_store, state)
 
 
+@app.post("/plan")
+def plan(request: InstructionRequest) -> dict[str, Any]:
+    """Generate a rebuild plan without executing. The agent reads, thinks, and proposes."""
+    from .plan_mode import generate_plan
+    from .context_explorer import build_broad_context
+    state = _normalize_payload(request.model_dump())
+    if not state.get("session_id"):
+        from .main import _ensure_session_id
+        state["session_id"] = _ensure_session_id(None)
+    state["broad_context"] = build_broad_context(state.get("session_id"), state.get("instruction", ""))
+    reference_path = state.get("context", {}).get("reference_path")
+    return generate_plan(state, reference_path=reference_path)
+
+
 @app.post("/queue/instruct")
 def queue_instruct(request: InstructionRequest) -> dict[str, Any]:
     state = _normalize_payload(request.model_dump())
