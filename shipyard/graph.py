@@ -256,6 +256,11 @@ def fetch_step_context(state: ShipyardState) -> dict:
         if sandboxed and sandboxed != target_path:
             target_path = sandboxed
             result["target_path"] = target_path
+            # Also update the preplanned action so downstream nodes see the sandboxed path
+            preplanned = state.get("preplanned_action")
+            if isinstance(preplanned, dict) and preplanned.get("target_path"):
+                updated_preplanned = {**preplanned, "target_path": target_path}
+                result["preplanned_action"] = updated_preplanned
 
     if target_path and edit_mode not in skip_read_modes:
         # Check file content cache first (populated by prior read_file steps
@@ -461,6 +466,11 @@ def _should_refine_preplanned_action(state: ShipyardState, preplanned: dict) -> 
 
 def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     target_path = preplanned.get("target_path") or state.get("target_path")
+    # Sandbox relative paths to session workspace
+    if target_path:
+        sandboxed = _sandbox_target_path(target_path, state)
+        if sandboxed:
+            target_path = sandboxed
     current_file_before = state.get("file_before")
     if target_path:
         target = Path(str(target_path))
@@ -485,23 +495,19 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
             "Preserve all existing content — only change what the instruction asks for."
         )
 
-    # Block write_file on valid existing files — force search_and_replace instead.
-    # write_file is fundamentally destructive: the LLM must regenerate the entire file
-    # from its context window, and it WILL drop content it doesn't think is relevant.
-    # search_and_replace can only change what it matches, so it can't nuke anything.
+    # Guide write_file on valid existing files: prefer search_and_replace via hints.
+    # The 30% content loss guard in apply_edit is the hard safety net — if the LLM
+    # uses write_file and drops too much content, it gets blocked there.
     if (
         planned_mode == "write_file"
         and not syntax_err
         and current_file_before
         and file_line_count > 10
     ):
-        planned_mode = "search_and_replace"
-        hint = (
-            "Use search_and_replace mode. Set anchor to the EXACT text you want to change "
-            "(copy it verbatim from the current file), and replacement to the new text. "
-            "Only the matched text will be replaced — all other content is preserved. "
-            "If you need to add new content, set anchor to the line AFTER which you want to insert, "
-            "and include that line plus the new content in replacement."
+        hint += (
+            "\nPrefer search_and_replace over write_file for targeted changes. "
+            "Set anchor to the EXACT text to change (verbatim from the file) and replacement to the new text. "
+            "write_file will be blocked if it loses >30% of existing content."
         )
 
     context["helper_notes"] = f"{context.get('helper_notes', '')}\n{hint}".strip()
@@ -528,17 +534,8 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     planned["provider_reason"] = (
         f"{planned.get('provider_reason') or ''} Refined from the current file/tool context."
     ).strip()
-    # Preserve the downgraded edit_mode: if we forced search_and_replace above,
-    # make sure the LLM's proposal respects it. Don't let it switch back to write_file.
-    if planned_mode == "search_and_replace" and planned.get("edit_mode") == "write_file":
-        # LLM tried to use write_file but we need search_and_replace.
-        # Convert: use the replacement as-is but switch mode.
-        planned["edit_mode"] = "search_and_replace"
-        # Re-validate after mode correction
-        from .proposal_validation import validate_proposal as _revalidate
-        errors = _revalidate(planned)
-        planned["is_valid"] = not errors
-        planned["validation_errors"] = errors
+    # If the LLM switched from write_file to anchor during refinement, keep it —
+    # the LLM knows the file contents and picked the appropriate mode.
     if not planned.get("validation_errors") and preplanned.get("validation_errors"):
         planned["validation_errors"] = list(preplanned.get("validation_errors") or [])
     if planned.get("is_valid") is None:

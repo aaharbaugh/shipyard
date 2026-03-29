@@ -4,7 +4,15 @@ import re
 from typing import Any
 
 
-FILENAME_PATTERN = re.compile(r"\b(?P<name>[\w.-]+\.[A-Za-z0-9]+)\b")
+FILENAME_PATTERN = re.compile(r"\b(?P<name>[\w./-]+\.(?:py|js|ts|tsx|jsx|css|html|json|md|yaml|yml|toml|txt|cfg|sh|sql|env|xml|csv|lock))\b")
+# Common code patterns that look like filenames but aren't
+_FALSE_POSITIVE_NAMES = {
+    "console.log", "process.env", "Date.now", "Math.random",
+    "Object.keys", "Array.from", "JSON.parse", "JSON.stringify",
+    "Promise.all", "Promise.resolve", "module.exports",
+    "require.resolve", "path.join", "path.resolve",
+    "e.g", "i.e", "etc.txt",
+}
 COUNT_PATTERN = re.compile(r"\b(?P<count>\d+|some)\b", flags=re.IGNORECASE)
 FILE_INDEX_PATTERN = re.compile(r"\bfile\s+(?P<index>\d+)\b", flags=re.IGNORECASE)
 
@@ -23,7 +31,7 @@ def extract_explicit_filenames(instruction: str) -> list[str]:
     filenames: list[str] = []
     for match in FILENAME_PATTERN.finditer(instruction or ""):
         name = match.group("name")
-        if name in seen:
+        if name in seen or name in _FALSE_POSITIVE_NAMES:
             continue
         seen.add(name)
         filenames.append(name)

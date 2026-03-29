@@ -503,7 +503,9 @@ def _register_requested_workspace(state: ShipyardState) -> None:
     session_id = state.get("session_id")
     context = state.get("context", {}) or {}
     workspace_path = context.get("workspace_path")
-    set_session_workspace(session_id, workspace_path)
+    # Only update workspace if explicitly requested — don't clobber existing bindings
+    if workspace_path:
+        set_session_workspace(session_id, workspace_path)
 
 
 def _run_action_plan(

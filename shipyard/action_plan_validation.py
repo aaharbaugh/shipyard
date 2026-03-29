@@ -40,12 +40,23 @@ def validate_action_plan(instruction: str, actions: list[dict[str, Any]]) -> lis
     if explicit_files:
         covered_files: set[str] = set()
         for action in actions:
-            if action.get("target_path"):
-                covered_files.add(Path(str(action.get("target_path"))).name)
+            tp = action.get("target_path")
+            if tp:
+                tp_str = str(tp)
+                covered_files.add(Path(tp_str).name)
+                covered_files.add(tp_str)  # also match full paths
+                # Match the relative suffix (api/src/routes/auth.ts matches auth.ts)
+                if "/" in tp_str:
+                    covered_files.add(tp_str.rsplit("/", 1)[-1])
             for file_spec in (action.get("files") or []):
                 if isinstance(file_spec, dict) and file_spec.get("path"):
-                    covered_files.add(Path(str(file_spec.get("path"))).name)
-        missing_files = [name for name in explicit_files if name not in covered_files]
+                    fp = str(file_spec["path"])
+                    covered_files.add(Path(fp).name)
+                    covered_files.add(fp)
+        missing_files = [
+            name for name in explicit_files
+            if name not in covered_files and Path(name).name not in covered_files
+        ]
         if missing_files:
             errors.append(
                 "Action plan did not cover all explicitly named files: " + ", ".join(missing_files) + "."
