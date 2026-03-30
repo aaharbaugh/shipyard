@@ -295,30 +295,29 @@ def _discover_test_command(state: ShipyardState) -> str | None:
 
 
 def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool:
-    """Check if the agent should automatically continue to the next phase."""
+    """Check if the agent should automatically continue until done."""
     instruction = (state.get("instruction") or "").lower()
-    # Only continue if the instruction explicitly asked for all phases
-    _continuous_signals = ("all phases", "every phase", "all steps", "entire plan", "whole plan", "execute everything")
+    _continuous_signals = (
+        "all phases", "every phase", "all steps", "entire plan", "whole plan",
+        "execute everything", "until", "keep going", "keep fixing",
+        "do not stop", "don't stop", "non-stop", "nonstop",
+        "fix everything", "fix all", "run until",
+    )
     if not any(signal in instruction for signal in _continuous_signals):
         return False
-    # Don't continue on hard failures (invalid plan, exception, cancelled)
-    status = result.get("status", "")
-    if status in ("invalid_action_plan", "cancelled"):
+    if result.get("status") in ("invalid_action_plan", "cancelled"):
         return False
-    # Don't continue if nothing was created/edited (stuck / plan complete)
+    # Continue if any work was done (files changed, steps completed, or errors found to fix)
     changed = result.get("changed_files") or []
     steps = result.get("action_steps") or []
     had_work = bool(changed) or any(
-        s.get("status") in ("edited", "verified", "observed")
+        s.get("status") in ("edited", "verified", "observed", "failed")
         for s in steps
     )
     if not had_work:
         return False
-    # Verify/test failures are non-fatal for continuous execution —
-    # the files were created, only the verify step failed (e.g. no pnpm install)
-    # So we keep going.
-    # Cap at 20 iterations
-    if state.get("_phase_iteration", 0) >= 20:
+    # Safety cap at 50 iterations
+    if state.get("_phase_iteration", 0) >= 50:
         return False
     return True
 
