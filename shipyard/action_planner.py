@@ -752,23 +752,52 @@ def _openai_headers(api_key: str) -> dict[str, str]:
     }
 
 
+_COST_LOG_PATH = Path(".shipyard/data/openai_costs.jsonl")
+
+# Approximate pricing per 1M tokens (as of 2026)
+_MODEL_PRICING = {
+    "gpt-5.4-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4.1-nano": {"input": 0.01, "output": 0.04},
+}
+
+
 def _log_openai_call(payload: dict[str, Any], response: httpx.Response, elapsed: float) -> None:
-    """Print a one-line summary of an OpenAI API call to server stdout."""
+    """Print a one-line summary and log cost to disk."""
     model = payload.get("model", "?")
     try:
         body = response.json()
         usage = body.get("usage") or {}
-        input_tok = usage.get("input_tokens") or usage.get("prompt_tokens") or "?"
-        output_tok = usage.get("output_tokens") or usage.get("completion_tokens") or "?"
+        input_tok = usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        output_tok = usage.get("output_tokens") or usage.get("completion_tokens") or 0
         total_tok = usage.get("total_tokens") or (
-            (input_tok + output_tok) if isinstance(input_tok, int) and isinstance(output_tok, int) else "?"
+            (input_tok + output_tok) if isinstance(input_tok, int) and isinstance(output_tok, int) else 0
         )
     except Exception:
-        input_tok = output_tok = total_tok = "?"
+        input_tok = output_tok = total_tok = 0
     print(
         f"[openai] {model}  in={input_tok} out={output_tok} total={total_tok}  {elapsed:.2f}s",
         flush=True,
     )
+    # Log to cost tracker
+    try:
+        pricing = _MODEL_PRICING.get(str(model), _MODEL_PRICING.get("gpt-5.4-mini", {}))
+        input_cost = (int(input_tok) / 1_000_000) * pricing.get("input", 0.15) if isinstance(input_tok, int) else 0
+        output_cost = (int(output_tok) / 1_000_000) * pricing.get("output", 0.60) if isinstance(output_tok, int) else 0
+        _COST_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_COST_LOG_PATH, "a") as f:
+            f.write(json.dumps({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "model": model,
+                "input_tokens": input_tok,
+                "output_tokens": output_tok,
+                "total_tokens": total_tok,
+                "input_cost": round(input_cost, 6),
+                "output_cost": round(output_cost, 6),
+                "total_cost": round(input_cost + output_cost, 6),
+                "elapsed": round(elapsed, 2),
+            }) + "\n")
+    except Exception:
+        pass
 
 
 def _post_openai_with_retry(
