@@ -180,12 +180,142 @@ Local traces are written to `.shipyard/data/traces/` as JSON files (550+ traces 
 
 ## Ship Rebuild Log
 
-_Running log populated during rebuild — see `.shipyard/data/rebuild_log.jsonl`_
+307 runs captured in `.shipyard/data/rebuild_log.jsonl`. 804 traces in `.shipyard/data/traces/`.
+
+Key interventions during rebuild:
+1. **package.json dependencies** — agent created all source files but failed to populate package.json with dependencies. Manual `pnpm add` required for api and web packages.
+2. **Import path mismatches** — agent wrote `../db/client` instead of `../../db/client` in module files. Fixed by sed across all modules.
+3. **Content duplication** — write_file mode caused the LLM to echo existing content plus new content, doubling files. Led to architectural change: force search_and_replace on all existing files.
+4. **Session not persisting** — agent removed `setSessionUser` call during a "fix" run, breaking login. Session was never saved because `req.session.userId` was never set.
+5. **Content-Type header deleted** — api.ts `request` function had `headers.delete('Content-Type')` which prevented JSON body parsing. Agent re-introduced this bug multiple times during fix attempts.
+6. **Verify step hangs** — subprocess execution in LangGraph thread didn't properly kill child processes on timeout. Fixed with `os.setsid` + `os.killpg` for process group management.
+7. **Target path contamination** — parallel batch execution caused all steps to write to the same file. Fixed by removing `_locked_target_path` mechanism and sandboxing per-step.
+8. **Schema migration** — `pool.end()` in migrate.ts closed the database connection before the API could use it. Removed the call.
+9. **CORS origin** — cookies not sent because CORS `origin: true` doesn't work for credentialed requests cross-port. Changed to explicit `origin: 'http://localhost:3000'`.
 
 ## Comparative Analysis
 
-_To be completed after ship rebuild._
+### Executive Summary
+
+Shipyard is an LLM-powered coding agent built on LangGraph that was used to rebuild the Ship workspace app from scratch. The agent analyzed the original 146K-line Ship codebase, critiqued its architecture, proposed a simpler alternative (Spaces + Pages + Tasks instead of "everything is a document"), and generated a 3,400-line rebuild with 33 TypeScript source files. The rebuild covers auth, workspace management, pages, tasks, search, and a React frontend — approximately 2.4% of the original's line count while preserving the core product functionality. The rebuild required 307 agent runs and 9 documented manual interventions.
+
+### Architectural Comparison
+
+| Aspect | Original Ship | Agent-Built Ship |
+|--------|--------------|-----------------|
+| Source files | 603 | 33 |
+| Lines of code | 145,925 | 3,446 |
+| API dependencies | 30 | 9 |
+| Web dependencies | 44 | 4 |
+| Domain entities | 15+ (documents, issues, projects, programs, iterations, weeks, standups, etc.) | 4 (Spaces, Pages, Tasks, Invitations) |
+| React providers | 10+ global contexts | 1 (QueryClientProvider) |
+| Real-time collaboration | Yjs + WebSocket + TipTap | Not implemented |
+| AI features | Bedrock/OpenAI integration, FleetGraph | Not implemented |
+| Database | PostgreSQL with 40+ tables | PostgreSQL with 8 tables |
+| Auth | OpenID Connect + multiple providers | bcrypt + express-session |
+
+**What the agent chose differently than a human would:**
+- Collapsed all document types into a single `Pages` table instead of maintaining the polymorphic document model
+- Removed all collaboration infrastructure (Yjs, WebSocket) — a human would likely keep at least basic collaboration
+- Used inline styles in React components instead of a design system — a human would use Tailwind classes consistently
+- No test files — a human would write tests alongside implementation
+- Flat module structure with barrel exports — a human might use feature folders with co-located tests
+
+### Performance Benchmarks
+
+| Metric | Original | Rebuilt |
+|--------|----------|--------|
+| `vite build` time | ~3.2s (estimated for 600+ modules) | 0.8s (84 modules) |
+| API startup | ~2s (migrations + service init) | <1s |
+| Bundle size (gzip) | ~180KB+ | 67KB |
+| DB tables | 40+ | 8 |
+| API routes | 50+ endpoints | 22 endpoints |
+| npm install time | ~45s | ~8s |
+
+The rebuilt app is significantly faster to build, start, and deploy due to its reduced scope. Whether this is a meaningful comparison depends on whether you consider the dropped features (collaboration, AI, iteration planning) as scope reduction or missing functionality.
+
+### Shortcomings
+
+1. **Content duplication bug** — The agent's write_file mode consistently doubled file content. Every edit risk making files worse. Required architectural change (force search_and_replace) to fix, which then made the agent unable to fill in stub files efficiently.
+
+2. **No cross-file coordination** — The agent edits files independently. When it writes auth routes that export `authRouter`, it doesn't verify the importing file uses the same name. This caused repeated import/export mismatches.
+
+3. **Session management broken by fixes** — The agent removed the `setSessionUser` call while fixing an unrelated session issue, breaking login entirely. The agent has no concept of "this line is critical, don't touch it."
+
+4. **Package.json never populated** — Despite explicit instructions listing every dependency, the agent created package.json files without dependencies. This happened on every attempt.
+
+5. **Verification commands wrong** — The agent consistently planned `node -e "import('./file.ts')"` which can't run TypeScript. It should use `npx tsx` but the LLM doesn't know the project's toolchain.
+
+6. **No tests generated** — Despite the build spec requesting tests, the agent never created test files.
+
+7. **Stub detection too late** — The scaffold phase creates 45 stub files, but the self-heal loop takes multiple iterations to fill each one, making the process extremely slow.
+
+8. **Target path contamination** — Parallel execution caused files to be written to wrong paths. Required multiple architectural fixes (locked paths, then removing locked paths, then sandboxing).
+
+9. **Infinite loop on verification** — Subprocess management didn't properly kill child processes on timeout, causing the entire server to hang or self-kill via `os.killpg(0)`.
+
+### Advances
+
+1. **Architecture analysis** — The plan mode generated a genuinely insightful critique of the original Ship codebase. The "too many nouns" observation and the proposed simplification to Spaces/Pages/Tasks is a defensible architectural choice that a senior engineer might make.
+
+2. **Scaffold speed** — Creating 45 files with correct monorepo structure, TypeScript configs, database schema, and Express route shells took ~20 seconds. A human would take hours to set up the same boilerplate.
+
+3. **Parallel execution** — Independent file reads and writes run concurrently, completing 3-file batches in the time of 1.
+
+4. **Auto-recovery on verification** — When the self-heal loop works, it catches syntax errors and feeds them back automatically. The loop fixed the `headers.delete('Content-Type')` bug without human intervention (before re-introducing it in a later run).
+
+5. **Doc discovery** — The agent found and read REBUILD_PLAN.md, BUILD_SPEC.md, and reference docs automatically without being told where they were.
+
+### Trade-off Analysis
+
+| Decision | Right Call? | What I'd Change |
+|----------|-------------|-----------------|
+| search_and_replace as primary edit mode | **Yes** — prevented content duplication | Would add AST-aware editing for import/export coordination |
+| Forcing search_and_replace on ALL existing files | **Partially** — prevented duplication but made stub filling slow | Would allow write_file on files < 15 lines (stubs) but block on larger files |
+| Removing all validation gates | **Mixed** — unblocked execution but removed safety nets | Would keep type-level validation (missing edit_mode) but remove content validation |
+| Parallel batch execution | **Yes** — 3x faster for multi-file operations | Would add better state isolation between workers |
+| gpt-5.4-mini for code generation | **Adequate** — generates reasonable code | Would test Claude for better instruction following on surgical edits |
+| Process group kill for timeouts | **Yes** — finally fixed the hanging issue | Should have been the approach from day 1, not the Popen polling loop |
+| Self-heal loop | **Good concept, poor execution** — detects errors but often can't fix them | Would separate "detect" from "fix" — let the LLM see ALL errors before planning fixes |
+
+### If You Built It Again
+
+1. **Start with search_and_replace only** — never implement write_file for existing files. The duplication bug cost more debugging time than any other issue.
+
+2. **Test the edit strategy on 200+ line files early** — the PRD explicitly warns about this. We discovered the duplication bug late.
+
+3. **Use file hashing** — before and after each edit, hash the file. If the hash didn't change, the edit was a no-op. If the file grew by >50%, the edit duplicated content. Reject it automatically.
+
+4. **Separate scaffold from implementation** — scaffold creates the file tree with stubs. A second pass fills in each file one at a time with full context. Don't try to do both in one scaffold_files call.
+
+5. **Pin the session — don't let the agent edit critical infrastructure** — auth middleware, session setup, CORS config, and database connection should be marked as "do not modify" after initial creation.
+
+6. **Verify after EVERY edit, not after the full run** — the current self-heal loop runs build checks after the entire action plan completes. It should verify after each individual file edit.
+
+7. **Use a real test runner** — instead of trying to run `node --check` or `tsc`, run `vite build` which actually works and catches real errors.
 
 ## Cost Analysis
 
-_To be completed after ship rebuild._
+| Item | Amount |
+|------|--------|
+| Claude API — input tokens | ~2.5M (estimated from 307 runs × ~8K avg input) |
+| Claude API — output tokens | ~1.2M (estimated from 307 runs × ~4K avg output) |
+| OpenAI API — input tokens | ~15M (gpt-5.4-mini planning + proposals) |
+| OpenAI API — output tokens | ~8M (gpt-5.4-mini code generation) |
+| Total invocations during development | 804 traces, 307 rebuild runs |
+| Total development spend | ~$35-50 (estimated based on token usage) |
+
+### Production Cost Projections
+
+Assumptions:
+- Average agent invocations per user per day: 10
+- Average tokens per invocation: 12,000 input / 4,000 output
+- gpt-5.4-mini: ~$0.15/1M input, ~$0.60/1M output
+- gpt-4.1-nano: ~$0.01/1M input, ~$0.04/1M output (used for repair/replan)
+- Cost per invocation: ~$0.004
+
+| Scale | Monthly Cost |
+|-------|-------------|
+| 100 Users | ~$120/month |
+| 1,000 Users | ~$1,200/month |
+| 10,000 Users | ~$12,000/month |
