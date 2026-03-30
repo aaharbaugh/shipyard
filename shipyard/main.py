@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import re
+import subprocess
 import uuid
 import copy
 import hashlib
@@ -322,6 +324,49 @@ def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool
     return True
 
 
+def _auto_verify_changed_files(state: ShipyardState, changed_files: list[str]) -> list[str]:
+    """Run quick syntax checks on changed files. Returns list of error strings."""
+    errors: list[str] = []
+    workspace = get_session_workspace(state.get("session_id"))
+    has_node_modules = (workspace / "node_modules").exists() or any(
+        (workspace / pkg / "node_modules").exists() for pkg in ["api", "web"]
+    )
+
+    for filepath in changed_files[:10]:
+        p = Path(filepath)
+        if not p.exists():
+            continue
+        suffix = p.suffix.lower()
+        try:
+            if suffix == ".py":
+                result = subprocess.run(
+                    ["python3", "-m", "py_compile", str(p)],
+                    capture_output=True, text=True, timeout=5,
+                    preexec_fn=os.setsid,
+                )
+                if result.returncode != 0:
+                    errors.append(f"{p.name}: {result.stderr.strip()[:200]}")
+            elif suffix in {".ts", ".tsx", ".js", ".jsx"} and has_node_modules:
+                # Quick syntax check with node
+                result = subprocess.run(
+                    ["node", "--check", str(p)] if suffix in {".js", ".jsx"} else
+                    ["node", "-e", f"require('fs').readFileSync('{p}','utf8')"],
+                    capture_output=True, text=True, timeout=5,
+                    cwd=str(workspace),
+                    preexec_fn=os.setsid,
+                )
+                if result.returncode != 0:
+                    errors.append(f"{p.name}: {result.stderr.strip()[:200]}")
+            elif suffix == ".json":
+                import json as _json
+                _json.loads(p.read_text())
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception as exc:
+            errors.append(f"{p.name}: {str(exc)[:200]}")
+    return errors
+
+
 _REBUILD_LOG_PATH = Path(".shipyard/data/rebuild_log.jsonl")
 
 
@@ -540,39 +585,64 @@ def run_once(
         _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
 
-        # Continuous execution: if the instruction asked for "all phases" and work
-        # was done (not a total failure), keep going with the next phase.
-        if _should_continue_phases(state, result):
-            phase_num = state.get("_phase_iteration", 0) + 1
-            max_phases = 20  # hard cap
-            if phase_num < max_phases:
-                print(f"\n[continuous] phase iteration {phase_num} — continuing...", flush=True)
-                _emit_progress(progress_callback, "continuous", {"phase": phase_num})
-                next_state = {
+        # Auto-verify and self-heal: after any run that changed files,
+        # check for errors and fix them automatically.
+        changed = result.get("changed_files") or []
+        iteration = state.get("_phase_iteration", 0)
+        if changed and iteration < 50:
+            verify_errors = _auto_verify_changed_files(state, changed)
+            if verify_errors:
+                iteration += 1
+                print(f"\n[self-heal] iteration {iteration} — {len(verify_errors)} error(s) found, fixing...", flush=True)
+                _emit_progress(progress_callback, "self_heal", {"iteration": iteration, "errors": len(verify_errors)})
+                error_summary = "\n".join(verify_errors[:5])
+                heal_state = {
                     **state,
                     "instruction": (
-                        f"Read REBUILD_PLAN.md. Continue executing the NEXT unfinished phase. "
-                        f"The previous run completed {len(result.get('changed_files') or [])} file(s). "
-                        f"Look at what files already exist and execute the next phase that hasn't been done yet. "
-                        f"Create all files with full content. Skip verification commands that require installed dependencies."
+                        f"The following errors were found after editing. Read the files and fix them:\n{error_summary}"
                     ),
-                    "_phase_iteration": phase_num,
+                    "_phase_iteration": iteration,
                     "tool_outputs": [],
                     "context": {
                         **dict(state.get("context") or {}),
                         "tool_outputs": [],
                     },
                 }
-                continuation = run_once(app, session_store, next_state, progress_callback)
-                # Merge results
+                heal_result = run_once(app, session_store, heal_state, progress_callback)
                 combined_changed = list({
                     *list(result.get("changed_files") or []),
-                    *list(continuation.get("changed_files") or []),
+                    *list(heal_result.get("changed_files") or []),
                 })
-                continuation["changed_files"] = combined_changed
-                continuation["_phase_iteration"] = phase_num
-                continuation["continuous_phases_completed"] = phase_num
-                return continuation
+                heal_result["changed_files"] = combined_changed
+                heal_result["_phase_iteration"] = iteration
+                heal_result["self_heal_iterations"] = iteration
+                return heal_result
+
+        # Also support continuous execution for "keep going" / "all phases" instructions
+        if _should_continue_phases(state, result):
+            iteration = state.get("_phase_iteration", 0) + 1
+            print(f"\n[continuous] iteration {iteration} — continuing...", flush=True)
+            _emit_progress(progress_callback, "continuous", {"iteration": iteration})
+            next_state = {
+                **state,
+                "instruction": (
+                    f"Continue where the previous run left off. "
+                    f"The previous run completed {len(changed)} file(s). "
+                    f"Look at what exists and do the next thing needed. "
+                    f"Original instruction: {state.get('request_instruction', state.get('instruction', ''))[:200]}"
+                ),
+                "_phase_iteration": iteration,
+                "tool_outputs": [],
+                "context": {**dict(state.get("context") or {}), "tool_outputs": []},
+            }
+            continuation = run_once(app, session_store, next_state, progress_callback)
+            combined_changed = list({
+                *list(result.get("changed_files") or []),
+                *list(continuation.get("changed_files") or []),
+            })
+            continuation["changed_files"] = combined_changed
+            continuation["_phase_iteration"] = iteration
+            return continuation
 
         return result
     except PlanningCancelledError:
