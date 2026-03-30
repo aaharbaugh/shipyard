@@ -495,11 +495,14 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     if syntax_err and file_line_count <= 300:
         hint = (
             "The target file has syntax errors. Use write_file mode. "
-            "Put the COMPLETE corrected file in replacement."
+            "The replacement field must contain ONLY the new file content. "
+            "Do NOT include the current file content twice — write it once from scratch."
         )
     else:
         hint = (
-            "Return the COMPLETE file with your changes applied. "
+            "Write the REPLACEMENT file content from scratch. "
+            "Do NOT copy-paste or repeat the current file content — it will be replaced entirely. "
+            "The replacement must contain the file ONCE, not the old content plus new content. "
             "Preserve all existing content — only change what the instruction asks for."
         )
 

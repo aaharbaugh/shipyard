@@ -63,7 +63,7 @@ def build_proposal_prompt(state: ShipyardState) -> str:
         "Return only JSON with keys: target_path, anchor, replacement, edit_mode, copy_count, quantity.",
         "Supported edit_mode values: write_file, search_and_replace, anchor, append, prepend, delete_file, copy_file, create_files, scaffold_files, rename_symbol.",
         "You are proposing a file edit. Use whatever mode fits best.",
-        "For write_file: replacement must be the COMPLETE file — all existing content plus changes. Do not drop anything the instruction didn't ask to remove.",
+        "For write_file: replacement is the NEW file content that will REPLACE the entire file. Write the file ONCE — do NOT duplicate or repeat sections. The current file content is shown below for reference only.",
         f"Instruction: {state.get('instruction', '').strip()}",
         f"Current target path: {state.get('target_path', '')}",
     ]
