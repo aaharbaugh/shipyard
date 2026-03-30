@@ -492,10 +492,10 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     planned_mode = preplanned.get("edit_mode") or state.get("edit_mode")
 
     # Force search_and_replace for ALL edits on existing files.
-    # write_file causes content duplication — the LLM echoes old content + new content.
-    # search_and_replace can only change what it matches, so it's physically safe.
-    # write_file is only allowed for new files (no current content) or broken files (syntax errors).
-    if current_file_before and not syntax_err and planned_mode == "write_file":
+    # Force search_and_replace on large existing files to prevent content duplication.
+    # Allow write_file on: new files, broken files (syntax errors), and small stubs (<15 lines).
+    is_stub = file_line_count < 15
+    if current_file_before and not syntax_err and not is_stub and planned_mode == "write_file":
         planned_mode = "search_and_replace"
 
     if syntax_err and file_line_count <= 300:

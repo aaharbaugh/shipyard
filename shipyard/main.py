@@ -325,28 +325,45 @@ def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool
 
 
 def _auto_verify_changed_files(state: ShipyardState, changed_files: list[str]) -> list[str]:
-    """Try to build the project and return any errors found."""
+    """Check for stub files and build errors. Returns list of issues to fix."""
     errors: list[str] = []
     workspace = get_session_workspace(state.get("session_id"))
 
-    # Detect what kind of project this is and run the appropriate build
-    build_commands: list[tuple[str, str]] = []
+    # Check for stub files that need real implementation
+    stub_files: list[str] = []
+    for f in sorted(workspace.rglob("*")):
+        if not f.is_file() or "node_modules" in str(f):
+            continue
+        if f.suffix in (".ts", ".tsx", ".js", ".jsx"):
+            try:
+                lines = f.read_text(errors="replace").splitlines()
+                # A file under 10 lines with only stubs/placeholders
+                if len(lines) < 10 and any(
+                    "not-implemented" in l.lower() or
+                    "placeholder" in l.lower() or
+                    "todo" in l.lower() or
+                    l.strip() == "export {};" or
+                    "res.json({ ok: true })" in l
+                    for l in lines
+                ):
+                    stub_files.append(str(f.relative_to(workspace)))
+            except Exception:
+                pass
 
-    # Node/web project — try vite build
+    if stub_files:
+        files_list = ", ".join(stub_files[:8])
+        errors.append(f"[stubs] These files are still stubs and need real implementation: {files_list}")
+
+    # Try build commands if dependencies are installed
+    build_commands: list[tuple[str, str]] = []
     if (workspace / "web" / "package.json").exists():
         web_has_modules = (workspace / "web" / "node_modules").exists() or (workspace / "node_modules").exists()
         if web_has_modules:
             build_commands.append(("web build", f"cd {workspace}/web && npx vite build 2>&1 | head -30"))
-
-    # Node/api project — try importing the entry
     if (workspace / "api" / "src" / "index.ts").exists():
         api_has_modules = (workspace / "api" / "node_modules").exists() or (workspace / "node_modules").exists()
         if api_has_modules:
-            build_commands.append(("api check", f"cd {workspace} && timeout 5 npx tsx --eval \"import('./api/src/app.js')\" 2>&1 | head -20"))
-
-    # Python project
-    if (workspace / "pyproject.toml").exists() or (workspace / "setup.py").exists():
-        build_commands.append(("python check", f"cd {workspace} && python -m py_compile $(find . -name '*.py' -not -path '*/node_modules/*' | head -10) 2>&1"))
+            build_commands.append(("api check", f"cd {workspace} && timeout 5 npx tsx api/src/index.ts 2>&1 | head -20"))
 
     for label, cmd in build_commands:
         try:
@@ -363,7 +380,7 @@ def _auto_verify_changed_files(state: ShipyardState, changed_files: list[str]) -
         except Exception:
             pass
 
-    # Also check individual changed files for JSON validity
+    # Check JSON files
     for filepath in changed_files[:5]:
         p = Path(filepath)
         if p.suffix == ".json" and p.exists():
@@ -619,12 +636,23 @@ def run_once(
                         error_files.add(match)
                 file_list = ", ".join(list(error_files)[:5]) if error_files else "the files mentioned in the errors"
 
+                # Determine if issues are stubs (need full rewrite) or errors (need fixes)
+                has_stubs = any("[stubs]" in e for e in verify_errors)
+                if has_stubs:
+                    heal_instruction = (
+                        f"These files are stubs that need real implementation. "
+                        f"Read BUILD_SPEC.md for requirements. Read each stub file, then rewrite it with full working code. "
+                        f"Use write_file mode since these are small stubs being replaced entirely.\n{error_summary}"
+                    )
+                else:
+                    heal_instruction = (
+                        f"Build errors found. Read {file_list} to see the current content, "
+                        f"then fix each error.\n{error_summary}"
+                    )
+
                 heal_state = {
                     **state,
-                    "instruction": (
-                        f"Build errors found. First read_file on {file_list} to see the current content. "
-                        f"Then use search_and_replace to fix each error. Here are the errors:\n{error_summary}"
-                    ),
+                    "instruction": heal_instruction,
                     "_phase_iteration": iteration,
                     "tool_outputs": [],
                     "context": {**dict(state.get("context") or {}), "tool_outputs": []},
