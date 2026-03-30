@@ -670,9 +670,12 @@ def run_once(
                 _log_rebuild_entry(state, result)
 
                 if not new_changed:
-                    # Agent couldn't fix anything — stop looping
-                    print(f"[self-heal] no changes made, stopping", flush=True)
-                    break
+                    # Agent couldn't fix anything this round — try 2 more times
+                    # with increasingly direct instructions before giving up
+                    if iteration % 3 == 0:
+                        print(f"[self-heal] no changes after {iteration} iterations, stopping", flush=True)
+                        break
+                    print(f"[self-heal] no changes, retrying with different approach...", flush=True)
                 continue
 
             # Step 2: Build passed — check if we should continue with more work
