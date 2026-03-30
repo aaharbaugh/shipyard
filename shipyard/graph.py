@@ -935,16 +935,7 @@ def apply_edit(state: ShipyardState) -> dict:
             "no_op": True,
         }
 
-    if state.get("edit_mode") in {"verify_command", "run_tests", "run_command"}:
-        # Skip ALL command execution. Period. They hang.
-        return {
-            "edit_applied": False,
-            "status": "observed",
-            "no_op": True,
-            "tool_output": {"tool": state.get("edit_mode"), "command": str(state.get("command") or ""), "skipped": True},
-        }
-
-    if False and state.get("edit_mode") == "run_command":  # dead code — kept for future re-enable
+    if state.get("edit_mode") in {"run_command", "verify_command", "run_tests"}:
         command = str(state.get("command") or "").strip()
         if not command:
             return {
@@ -962,83 +953,55 @@ def apply_edit(state: ShipyardState) -> dict:
                 "status": "edit_blocked",
                 "error": "Command injection syntax is not allowed.",
             }
+        import os
+        import signal
         cwd = get_session_workspace(state.get("session_id"))
-        # Use shell=True if the command uses shell features (pipes, redirects, chaining)
+        timeout_secs = min(int(state.get("timeout_seconds") or 10), 10)
         _SHELL_FEATURES = ("|", ">", "<", "&&", "||", ";", "2>&1")
         use_shell = any(token in command for token in _SHELL_FEATURES)
-        process = subprocess.Popen(
-            command if use_shell else shlex.split(command),
-            shell=use_shell,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        cancel_check = state.get("cancel_check")
-        deadline = time.monotonic() + min(int(state.get("timeout_seconds") or 15), 15)
-        stdout = ""
-        stderr = ""
-        returncode = None
-        while True:
-            if callable(cancel_check) and cancel_check():
-                process.terminate()
-                try:
-                    stdout, stderr = process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                return {
-                    "edit_applied": False,
-                    "status": "cancelled",
-                    "tool_output": {
-                        "tool": state.get("edit_mode"),
-                        "command": command,
-                        "cwd": str(cwd),
-                        "stdout": stdout[:4000],
-                        "stderr": stderr[:4000],
-                    },
-                    "no_op": True,
-                    "error": "Run cancelled.",
-                }
-            if time.monotonic() >= deadline:
-                process.terminate()
-                try:
-                    stdout, stderr = process.communicate(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                return {
-                    "edit_applied": False,
-                    "status": "verification_failed" if state.get("edit_mode") in {"verify_command", "run_tests"} else "failed",
-                    "tool_output": {
-                        "tool": state.get("edit_mode"),
-                        "command": command,
-                        "cwd": str(cwd),
-                        "stdout": stdout[:4000],
-                        "stderr": stderr[:4000],
-                    },
-                    "no_op": True,
-                    "error": f"Command timed out after {int(state.get('timeout_seconds') or 20)} seconds.",
-                }
-            returncode = process.poll()
-            if returncode is not None:
-                stdout, stderr = process.communicate()
-                break
-            time.sleep(0.1)
-        is_verification = state.get("edit_mode") in {"verify_command", "run_tests"}
+        try:
+            # Use process group so we can kill the entire tree on timeout
+            result = subprocess.run(
+                command if use_shell else shlex.split(command),
+                shell=use_shell,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout_secs,
+                preexec_fn=os.setsid,
+            )
+            stdout = (result.stdout or "")[:4000]
+            stderr = (result.stderr or "")[:4000]
+            returncode = result.returncode
+        except subprocess.TimeoutExpired as exc:
+            # Kill the entire process group
+            try:
+                os.killpg(os.getpgid(exc.args[0] if isinstance(exc.args[0], int) else 0), signal.SIGKILL)
+            except (ProcessLookupError, OSError, TypeError):
+                pass
+            stdout = str(exc.stdout or "")[:4000] if exc.stdout else ""
+            stderr = str(exc.stderr or "")[:4000] if exc.stderr else f"Command timed out after {timeout_secs}s"
+            returncode = -1
+        except Exception as exc:
+            stdout = ""
+            stderr = str(exc)[:4000]
+            returncode = -1
+
+        is_verify = state.get("edit_mode") in {"verify_command", "run_tests"}
+        ok = returncode == 0
         return {
             "edit_applied": False,
-            "status": ("verified" if returncode == 0 else "verification_failed") if is_verification else ("observed" if returncode == 0 else "verification_failed"),
+            "status": ("verified" if ok else "verification_failed") if is_verify else ("observed" if ok else "failed"),
             "tool_output": {
                 "tool": state.get("edit_mode"),
                 "command": command,
                 "cwd": str(cwd),
                 "returncode": returncode,
-                "stdout": stdout[:4000],
-                "stderr": stderr[:4000],
+                "stdout": stdout,
+                "stderr": stderr,
             },
             "no_op": True,
-            "error": None if returncode == 0 else f"Command failed with exit code {returncode}.",
+            "error": None if ok else stderr[:200],
         }
 
     if state.get("edit_mode") == "create_directory":
@@ -1824,10 +1787,16 @@ def _detect_auto_verification_commands(state: ShipyardState) -> list[str]:
 
 
 def verify_edit(state: ShipyardState) -> dict:
-    # Skip auto-verification (tsc, node --check) — these hang without node_modules.
-    # Only run explicitly requested verification_commands.
+    # Skip verification on no-op edits
+    if state.get("no_op") and not state.get("edit_applied"):
+        return {
+            "verification_results": [],
+            "verification_retry_count": int(state.get("verification_retry_count") or 0),
+            "status": state.get("status", "edited"),
+        }
     commands = list(state.get("verification_commands") or [])
-    # Don't auto-detect — they hang on monorepo rebuilds without node_modules
+    if not commands:
+        commands = _detect_auto_verification_commands(state)
     if not commands:
         return {
             "verification_results": [],

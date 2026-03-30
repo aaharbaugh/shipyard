@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import os
 import shlex
+import signal
 import subprocess
 from typing import Any
 
-# Only block true injection vectors — pipes and chaining are allowed via shell=True.
 _BLOCKED_TOKENS = ("\x00", "$(", "`")
-
-# Hard timeout per verification command (seconds).
-_VERIFY_TIMEOUT = 120
+_VERIFY_TIMEOUT = 10  # 10 seconds hard cap — enough to catch errors, not enough to hang
 
 
 def run_verification(commands: list[str]) -> list[dict[str, Any]]:
@@ -16,36 +15,13 @@ def run_verification(commands: list[str]) -> list[dict[str, Any]]:
 
     for command in commands:
         cmd_str = str(command).strip()
-        # Reject shell metacharacters before execution.
         if any(token in cmd_str for token in _BLOCKED_TOKENS):
-            results.append(
-                {
-                    "command": cmd_str,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"Unsafe shell syntax blocked in verification command: {cmd_str!r}",
-                }
-            )
+            results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": "Blocked"})
             continue
 
         _SHELL_FEATURES = ("|", ">", "<", "&&", "||", ";", "2>&1")
         use_shell = any(token in cmd_str for token in _SHELL_FEATURES)
-
-        if not use_shell:
-            try:
-                args = shlex.split(cmd_str)
-            except ValueError as exc:
-                results.append(
-                    {
-                        "command": cmd_str,
-                        "returncode": -1,
-                        "stdout": "",
-                        "stderr": f"Could not parse verification command: {exc}",
-                    }
-                )
-                continue
-        else:
-            args = cmd_str
+        args = cmd_str if use_shell else shlex.split(cmd_str)
 
         try:
             completed = subprocess.run(
@@ -55,32 +31,22 @@ def run_verification(commands: list[str]) -> list[dict[str, Any]]:
                 text=True,
                 check=False,
                 timeout=_VERIFY_TIMEOUT,
+                preexec_fn=os.setsid,
             )
-            results.append(
-                {
-                    "command": cmd_str,
-                    "returncode": completed.returncode,
-                    "stdout": completed.stdout.strip(),
-                    "stderr": completed.stderr.strip(),
-                }
-            )
+            results.append({
+                "command": cmd_str,
+                "returncode": completed.returncode,
+                "stdout": (completed.stdout or "").strip()[:2000],
+                "stderr": (completed.stderr or "").strip()[:2000],
+            })
         except subprocess.TimeoutExpired:
-            results.append(
-                {
-                    "command": cmd_str,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"Verification command timed out after {_VERIFY_TIMEOUT}s.",
-                }
-            )
-        except FileNotFoundError:
-            results.append(
-                {
-                    "command": cmd_str,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"Command not found: {args[0]!r}",
-                }
-            )
+            # Kill entire process group
+            try:
+                os.killpg(os.getpgid(0), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": f"Timed out ({_VERIFY_TIMEOUT}s)"})
+        except (FileNotFoundError, ValueError) as exc:
+            results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": str(exc)[:200]})
 
     return results
