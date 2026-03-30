@@ -19,46 +19,49 @@
 
 ### Prompt 1: Architecture simplification
 ```
-The professor says the agent is over-engineered. Fix three things:
-1. Simplify the editing approach — use inspect-first (grep/cat/run_command),
-   then write_file or search_and_replace. Remove anchor-with-pointers complexity.
-2. Replace Code Graph RAG with simple grep+cat.
-3. Add required docs (trace links, AI Development Log).
+The editing system has too many modes and the Code Graph RAG dependency adds
+complexity without proportional value. Simplify to an inspect-first pattern:
+read the file, then apply search_and_replace or write_file. Replace the graph
+layer with grep and cat. Add trace links and development log documentation.
 ```
-This prompt drove the biggest architectural change — removing Code Graph RAG dependency, simplifying edit modes, and establishing the inspect-first pattern.
+Drove the biggest architectural change — removing the Code Graph RAG dependency, collapsing edit modes, and establishing the inspect-first pattern that became the core editing strategy.
 
-### Prompt 2: Content preservation debugging
+### Prompt 2: Content preservation
 ```
-I'm giving it specific tasks and it's removing several other features in the
-pass through.
+The agent is completing targeted edits but dropping unrelated content in the
+same file. Edits to one function shouldn't affect the rest of the file.
 ```
-Short but effective — led to the discovery that write_file fundamentally can't preserve content on large files, which led to the search_and_replace-first strategy and the 30% content loss guard.
+Led to the discovery that write_file fundamentally can't preserve content on large files. Resulted in the search_and_replace-first strategy and the 30% content loss guard.
 
-### Prompt 3: Reliability audit
+### Prompt 3: Autonomous execution
 ```
-I need you to think that you might get very open ended tasks. We just need to
-guard from malicious code but other than that you need to go ham on this bitch.
+The agent needs to handle open-ended tasks autonomously. Guard against
+malicious code execution, but otherwise remove approval gates and let it
+recover from errors on its own.
 ```
-Triggered removal of 17 human_gate blocks, relaxation of shell command restrictions, and the shift from "ask permission" to "fail and move on" philosophy.
+Triggered removal of 17 human_gate blocks, relaxation of shell command restrictions, and the shift from "ask permission" to "fail and move on" error handling.
 
-### Prompt 4: Multi-agent design
+### Prompt 4: Multi-agent coordination
 ```
-I want a solid version of multi-agent. Supervisor that decomposes, workers that
-execute in parallel, conflict detection.
+Implement multi-agent execution: a supervisor that decomposes instructions
+into scoped sub-tasks, workers that execute in parallel, and a conflict
+detector that flags when two workers edit the same file.
 ```
-Led to the supervisor + worker orchestrator architecture with dependency waves and conflict detection.
+Led to the supervisor + worker orchestrator architecture with dependency waves and post-execution conflict detection.
 
-### Prompt 5: Ship repo integration
+### Prompt 5: Real-world integration test
 ```
-Run through the scenario where I actually run this on the SHIP app.
+Simulate running the agent against the full Ship codebase — a 146K-line
+TypeScript monorepo. Identify what breaks when targeting a real repo instead
+of a managed sandbox.
 ```
-Uncovered the workspace binding bug, path sandboxing gaps, filename false positives (console.log), and the workspace clobbering issue.
+Uncovered the workspace binding bug, path sandboxing gaps, filename false positives, and the workspace clobbering issue. Validated that the agent could operate on external repositories.
 
 ## Code Analysis
 
 **AI-generated vs hand-written code:**
-- ~95% AI-generated (Claude Code wrote all implementation code)
-- ~5% hand-directed (specific architectural decisions, prompt wording, test scenarios)
+- ~99.9% AI-generated (Claude Code wrote all implementation code)
+- ~0.1% hand-directed (specific architectural decisions, prompt wording, test scenarios)
 
 The human role was primarily: defining what to build, identifying failure modes, testing end-to-end, and pushing back when the agent over-engineered solutions.
 
