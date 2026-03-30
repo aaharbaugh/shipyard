@@ -475,12 +475,10 @@ def run_once(
         actions_count = len(action_plan.get("actions") or [])
         provider = action_plan.get("provider") or "?"
         print(f"[run] plan ready  provider={provider} steps={actions_count}", flush=True)
+        # Don't bail on invalid plans — execute whatever valid actions exist.
+        # The old behavior returned immediately, killing the self-heal loop.
         if not action_plan.get("is_valid", True):
-            result = _invalid_action_plan_result(state, action_plan)
-            result = _persist_result(session_store, result)
-            _log_rebuild_entry(state, result)
-            _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
-            return result
+            print(f"[run] plan has validation issues, executing anyway: {action_plan.get('validation_errors', [])}", flush=True)
         # Auto-branch: create a feature branch before any edits touch files
         has_mutate = any(
             (a.get("action_class") or "") == "mutate"
@@ -612,16 +610,32 @@ def run_once(
                 print(f"  {verify_errors[0][:100]}...", flush=True)
                 _emit_progress(progress_callback, "self_heal", {"iteration": iteration, "errors": len(verify_errors)})
 
+                # Extract filenames from errors so the agent knows what to read
+                error_files = set()
+                for err in verify_errors:
+                    # Look for file paths in the error text
+                    import re as _re
+                    for match in _re.findall(r'[\w./\\-]+\.(?:ts|tsx|js|jsx|json|py)', err):
+                        error_files.add(match)
+                file_list = ", ".join(list(error_files)[:5]) if error_files else "the files mentioned in the errors"
+
                 heal_state = {
                     **state,
-                    "instruction": f"Build errors found. Read the files and fix them:\n{error_summary}",
+                    "instruction": (
+                        f"Build errors found. First read_file on {file_list} to see the current content. "
+                        f"Then use search_and_replace to fix each error. Here are the errors:\n{error_summary}"
+                    ),
                     "_phase_iteration": iteration,
                     "tool_outputs": [],
                     "context": {**dict(state.get("context") or {}), "tool_outputs": []},
                 }
+                heal_plan = _plan_actions_with_cancellation(heal_state)
+                if not heal_plan.get("actions"):
+                    print(f"[self-heal] planner returned no actions, stopping", flush=True)
+                    break
                 heal_result = _run_action_plan(
                     app, heal_state,
-                    _plan_actions_with_cancellation(heal_state),
+                    heal_plan,
                     progress_callback,
                 )
                 new_changed = heal_result.get("changed_files") or []

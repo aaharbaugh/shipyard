@@ -212,37 +212,6 @@ class MainInputTests(unittest.TestCase):
         self.assertEqual(result["instruction"], "create 2 files and write hello")
         self.assertEqual(result["request_instruction"], "create 2 files and write hello")
 
-    def test_run_once_short_circuits_invalid_action_plan(self) -> None:
-        app = Mock()
-        session_store = Mock()
-
-        with patch("shipyard.main.PromptLog") as prompt_log_cls, patch(
-            "shipyard.main.generate_spec_bundle",
-            return_value={"mode": "direct_edit", "created": False},
-        ), patch(
-            "shipyard.main.plan_actions",
-            return_value={
-                "actions": [{"instruction": "write main.py", "valid": True}],
-                "provider": "openai",
-                "provider_reason": "planned",
-                "is_valid": False,
-                "validation_errors": ["Action plan did not cover all explicitly named files: config.json."],
-            },
-        ):
-            prompt_log_cls.return_value.append = Mock()
-            result = run_once(
-                app,
-                session_store,
-                {
-                    "session_id": "demo",
-                    "instruction": "Create a tiny repo with main.py and config.json",
-                },
-            )
-
-        app.invoke.assert_not_called()
-        self.assertEqual(result["status"], "invalid_action_plan")
-        self.assertIn("config.json", result["execution"]["error"])
-        self.assertIn("troubleshooting_path", result["artifacts"])
 
     def test_run_once_persists_failed_result_when_execution_raises(self) -> None:
         app = Mock()
