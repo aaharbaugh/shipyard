@@ -360,10 +360,7 @@ def _auto_verify_changed_files(state: ShipyardState, changed_files: list[str]) -
         web_has_modules = (workspace / "web" / "node_modules").exists() or (workspace / "node_modules").exists()
         if web_has_modules:
             build_commands.append(("web build", f"cd {workspace}/web && npx vite build 2>&1 | head -30"))
-    if (workspace / "api" / "src" / "index.ts").exists():
-        api_has_modules = (workspace / "api" / "node_modules").exists() or (workspace / "node_modules").exists()
-        if api_has_modules:
-            build_commands.append(("api check", f"cd {workspace} && timeout 5 npx tsx api/src/index.ts 2>&1 | head -20"))
+    # Skip API runtime check — needs database. Stub detection covers code quality.
 
     for label, cmd in build_commands:
         try:
