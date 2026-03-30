@@ -1045,6 +1045,12 @@ WORKBENCH_HTML = """<!doctype html>
         </div>
         <details>
           <summary>Settings &amp; Workspace</summary>
+          <div style="margin: 8px 0 12px; padding: 8px; border: 1px solid rgba(251,191,36,0.3); border-radius: 8px; background: rgba(251,191,36,0.05);">
+            <label for="api_key_input" style="font-size:0.82rem; font-weight:600;">OpenAI API Key</label>
+            <input id="api_key_input" type="password" placeholder="sk-..." style="margin-top:4px;" />
+            <button class="secondary" id="api_key_save" style="margin-top:6px;">Save Key</button>
+            <div class="muted" style="font-size:0.76rem; margin-top:4px;" id="api_key_status"></div>
+          </div>
           <p class="muted" id="workspace_details" style="font-size:0.84rem; margin: 8px 0 4px;">Attach this session to any folder — type a path or pick from the list.</p>
           <label for="workspace_select">Workspace Path</label>
           <input id="workspace_select" placeholder="/home/aaron/projects/gauntlet/ship/ship-rebuild" list="workspace_options" />
@@ -2901,6 +2907,46 @@ WORKBENCH_HTML = """<!doctype html>
       }
     }
 
+    // API Key management
+    function loadApiKey() {
+      return localStorage.getItem("shipyard_api_key") || "";
+    }
+    function saveApiKey(key) {
+      if (key) {
+        localStorage.setItem("shipyard_api_key", key);
+      } else {
+        localStorage.removeItem("shipyard_api_key");
+      }
+    }
+    document.getElementById("api_key_save").addEventListener("click", async () => {
+      const key = document.getElementById("api_key_input").value.trim();
+      if (!key) return;
+      saveApiKey(key);
+      // Send to server to set as env var for this session
+      try {
+        await fetch("/api-key", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({key}),
+        });
+        document.getElementById("api_key_status").textContent = "Key saved ✓";
+      } catch {
+        document.getElementById("api_key_status").textContent = "Saved locally";
+      }
+    });
+    // Restore saved key on load
+    const savedKey = loadApiKey();
+    if (savedKey) {
+      document.getElementById("api_key_input").value = savedKey;
+      document.getElementById("api_key_status").textContent = "Key loaded from storage";
+      // Auto-send to server
+      fetch("/api-key", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({key: savedKey}),
+      }).catch(() => {});
+    }
+
     async function initializeWorkbench() {
       loadPlannerStatus();
       loadGraphStatus();
@@ -2951,6 +2997,18 @@ WORKBENCH_HTML = """<!doctype html>
 </body>
 </html>
 """
+
+
+class ApiKeyRequest(BaseModel):
+    key: str
+
+
+@app.post("/api-key")
+def set_api_key(request: ApiKeyRequest) -> dict[str, str]:
+    """Set the OpenAI API key at runtime — stored in process env, not on disk."""
+    import os
+    os.environ["OPENAI_API_KEY"] = request.key
+    return {"status": "ok", "message": "API key set for this session"}
 
 
 @app.get("/health")
