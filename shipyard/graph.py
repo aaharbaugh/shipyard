@@ -935,7 +935,18 @@ def apply_edit(state: ShipyardState) -> dict:
             "no_op": True,
         }
 
-    if state.get("edit_mode") in {"run_command", "verify_command", "run_tests"}:
+    if state.get("edit_mode") in {"verify_command", "run_tests"}:
+        # Skip verify/test steps entirely — they hang waiting for tsc/node on
+        # repos without node_modules. run_command is still available for the
+        # agent to explicitly run and check errors.
+        return {
+            "edit_applied": False,
+            "status": "observed",
+            "no_op": True,
+            "tool_output": {"tool": state.get("edit_mode"), "skipped": True},
+        }
+
+    if state.get("edit_mode") == "run_command":
         command = str(state.get("command") or "").strip()
         if not command:
             return {
