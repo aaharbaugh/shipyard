@@ -960,28 +960,29 @@ def apply_edit(state: ShipyardState) -> dict:
         _SHELL_FEATURES = ("|", ">", "<", "&&", "||", ";", "2>&1")
         use_shell = any(token in command for token in _SHELL_FEATURES)
         try:
-            # Use process group so we can kill the entire tree on timeout
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command if use_shell else shlex.split(command),
                 shell=use_shell,
                 cwd=str(cwd),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_secs,
                 preexec_fn=os.setsid,
             )
-            stdout = (result.stdout or "")[:4000]
-            stderr = (result.stderr or "")[:4000]
-            returncode = result.returncode
-        except subprocess.TimeoutExpired as exc:
-            # Kill the entire process group
             try:
-                os.killpg(os.getpgid(exc.args[0] if isinstance(exc.args[0], int) else 0), signal.SIGKILL)
-            except (ProcessLookupError, OSError, TypeError):
-                pass
-            stdout = str(exc.stdout or "")[:4000] if exc.stdout else ""
-            stderr = str(exc.stderr or "")[:4000] if exc.stderr else f"Command timed out after {timeout_secs}s"
-            returncode = -1
+                stdout, stderr = proc.communicate(timeout=timeout_secs)
+                returncode = proc.returncode
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                proc.wait()
+                stdout = ""
+                stderr = f"Command timed out after {timeout_secs}s"
+                returncode = -1
+            stdout = (stdout or "")[:4000]
+            stderr = (stderr or "")[:4000]
         except Exception as exc:
             stdout = ""
             stderr = str(exc)[:4000]

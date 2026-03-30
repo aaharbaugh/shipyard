@@ -7,7 +7,7 @@ import subprocess
 from typing import Any
 
 _BLOCKED_TOKENS = ("\x00", "$(", "`")
-_VERIFY_TIMEOUT = 10  # 10 seconds hard cap — enough to catch errors, not enough to hang
+_VERIFY_TIMEOUT = 10
 
 
 def run_verification(commands: list[str]) -> list[dict[str, Any]]:
@@ -24,29 +24,31 @@ def run_verification(commands: list[str]) -> list[dict[str, Any]]:
         args = cmd_str if use_shell else shlex.split(cmd_str)
 
         try:
-            completed = subprocess.run(
+            proc = subprocess.Popen(
                 args,
                 shell=use_shell,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                check=False,
-                timeout=_VERIFY_TIMEOUT,
                 preexec_fn=os.setsid,
             )
-            results.append({
-                "command": cmd_str,
-                "returncode": completed.returncode,
-                "stdout": (completed.stdout or "").strip()[:2000],
-                "stderr": (completed.stderr or "").strip()[:2000],
-            })
-        except subprocess.TimeoutExpired:
-            # Kill entire process group
             try:
-                os.killpg(os.getpgid(0), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": f"Timed out ({_VERIFY_TIMEOUT}s)"})
-        except (FileNotFoundError, ValueError) as exc:
+                stdout, stderr = proc.communicate(timeout=_VERIFY_TIMEOUT)
+                results.append({
+                    "command": cmd_str,
+                    "returncode": proc.returncode,
+                    "stdout": (stdout or "").strip()[:2000],
+                    "stderr": (stderr or "").strip()[:2000],
+                })
+            except subprocess.TimeoutExpired:
+                # Kill the entire process group using the actual PID
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                proc.wait()
+                results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": f"Timed out ({_VERIFY_TIMEOUT}s)"})
+        except (FileNotFoundError, ValueError, OSError) as exc:
             results.append({"command": cmd_str, "returncode": -1, "stdout": "", "stderr": str(exc)[:200]})
 
     return results
