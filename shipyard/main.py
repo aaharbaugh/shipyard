@@ -325,45 +325,54 @@ def _should_continue_phases(state: ShipyardState, result: ShipyardState) -> bool
 
 
 def _auto_verify_changed_files(state: ShipyardState, changed_files: list[str]) -> list[str]:
-    """Run quick syntax checks on changed files. Returns list of error strings."""
+    """Try to build the project and return any errors found."""
     errors: list[str] = []
     workspace = get_session_workspace(state.get("session_id"))
-    has_node_modules = (workspace / "node_modules").exists() or any(
-        (workspace / pkg / "node_modules").exists() for pkg in ["api", "web"]
-    )
 
-    for filepath in changed_files[:10]:
-        p = Path(filepath)
-        if not p.exists():
-            continue
-        suffix = p.suffix.lower()
+    # Detect what kind of project this is and run the appropriate build
+    build_commands: list[tuple[str, str]] = []
+
+    # Node/web project — try vite build
+    if (workspace / "web" / "package.json").exists():
+        web_has_modules = (workspace / "web" / "node_modules").exists() or (workspace / "node_modules").exists()
+        if web_has_modules:
+            build_commands.append(("web build", f"cd {workspace}/web && npx vite build 2>&1 | head -30"))
+
+    # Node/api project — try importing the entry
+    if (workspace / "api" / "src" / "index.ts").exists():
+        api_has_modules = (workspace / "api" / "node_modules").exists() or (workspace / "node_modules").exists()
+        if api_has_modules:
+            build_commands.append(("api check", f"cd {workspace} && timeout 5 npx tsx --eval \"import('./api/src/app.js')\" 2>&1 | head -20"))
+
+    # Python project
+    if (workspace / "pyproject.toml").exists() or (workspace / "setup.py").exists():
+        build_commands.append(("python check", f"cd {workspace} && python -m py_compile $(find . -name '*.py' -not -path '*/node_modules/*' | head -10) 2>&1"))
+
+    for label, cmd in build_commands:
         try:
-            if suffix == ".py":
-                result = subprocess.run(
-                    ["python3", "-m", "py_compile", str(p)],
-                    capture_output=True, text=True, timeout=5,
-                    preexec_fn=os.setsid,
-                )
-                if result.returncode != 0:
-                    errors.append(f"{p.name}: {result.stderr.strip()[:200]}")
-            elif suffix in {".ts", ".tsx", ".js", ".jsx"} and has_node_modules:
-                # Quick syntax check with node
-                result = subprocess.run(
-                    ["node", "--check", str(p)] if suffix in {".js", ".jsx"} else
-                    ["node", "-e", f"require('fs').readFileSync('{p}','utf8')"],
-                    capture_output=True, text=True, timeout=5,
-                    cwd=str(workspace),
-                    preexec_fn=os.setsid,
-                )
-                if result.returncode != 0:
-                    errors.append(f"{p.name}: {result.stderr.strip()[:200]}")
-            elif suffix == ".json":
-                import json as _json
-                _json.loads(p.read_text())
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=15, preexec_fn=os.setsid,
+            )
+            if result.returncode != 0:
+                output = (result.stderr or result.stdout or "").strip()[:500]
+                if output and "error" in output.lower():
+                    errors.append(f"[{label}] {output}")
         except subprocess.TimeoutExpired:
             pass
-        except Exception as exc:
-            errors.append(f"{p.name}: {str(exc)[:200]}")
+        except Exception:
+            pass
+
+    # Also check individual changed files for JSON validity
+    for filepath in changed_files[:5]:
+        p = Path(filepath)
+        if p.suffix == ".json" and p.exists():
+            try:
+                import json as _json
+                _json.loads(p.read_text())
+            except Exception as exc:
+                errors.append(f"{p.name}: invalid JSON — {exc}")
+
     return errors
 
 
