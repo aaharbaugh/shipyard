@@ -146,10 +146,11 @@ Tasks with `depends_on` wait for their dependencies to complete before starting.
 
 ## Trace Links
 
-- Trace 1 (normal multi-file edit): _to be filled after ship rebuild_
-- Trace 2 (error recovery path): _to be filled after ship rebuild_
+- Full trace dataset: https://smith.langchain.com/public/9d546ecc-3825-489d-bcda-b8ca14e04e5c/d
+- Trace 1 (normal run — scaffold + edit): Select any `shipyard.run_step` trace with status `edited`
+- Trace 2 (error recovery — verification failure + retry): Select any trace showing `verification_failed` → `retry_ready` → `edited`
 
-Local traces are written to `.shipyard/data/traces/` as JSON files (550+ traces captured during development). LangSmith integration is configured via `LANGSMITH_API_KEY` environment variable.
+804+ local traces also written to `.shipyard/data/traces/` as JSON files.
 
 ## Architecture Decisions
 
@@ -298,12 +299,15 @@ The rebuilt app is significantly faster to build, start, and deploy due to its r
 
 | Item | Amount |
 |------|--------|
-| Claude API — input tokens | ~2.5M (estimated from 307 runs × ~8K avg input) |
-| Claude API — output tokens | ~1.2M (estimated from 307 runs × ~4K avg output) |
-| OpenAI API — input tokens | ~15M (gpt-5.4-mini planning + proposals) |
-| OpenAI API — output tokens | ~8M (gpt-5.4-mini code generation) |
-| Total invocations during development | 804 traces, 307 rebuild runs |
-| Total development spend | ~$35-50 (estimated based on token usage) |
+| LangSmith tracked traces | 4,063 |
+| LangSmith tracked tokens | 1,938 |
+| LangSmith tracked cost | $0.01 |
+| OpenAI API calls (direct httpx) | ~900 (307 runs × ~3 calls avg: plan + refine + repair) |
+| OpenAI estimated input tokens | ~7.2M (900 calls × ~8K avg input) |
+| OpenAI estimated output tokens | ~2.7M (900 calls × ~3K avg output) |
+| Total development spend | ~$8-15 estimated (OpenAI usage not instrumented through LangSmith) |
+
+Note: LangSmith tracks the LangGraph step orchestration but not the direct OpenAI API calls made via httpx in `action_planner.py` and `proposal.py`. The actual token usage is on the OpenAI dashboard under the API key owner's account.
 
 ### Production Cost Projections
 
