@@ -594,65 +594,85 @@ def run_once(
         _log_rebuild_entry(state, result)
         _emit_progress(progress_callback, "completed", {"status": result.get("status"), "trace_path": result.get("trace_path")})
 
-        # Auto-verify and self-heal: after any run that changed files,
-        # check for errors and fix them automatically.
-        changed = result.get("changed_files") or []
+        # Autonomous loop: verify → fix → verify → fix until clean or max iterations.
+        # This replaces the old self-heal and continuous loops with one unified loop.
         iteration = state.get("_phase_iteration", 0)
-        if changed and iteration < 50:
-            verify_errors = _auto_verify_changed_files(state, changed)
+        all_changed = list(result.get("changed_files") or [])
+        original_instruction = state.get("request_instruction") or state.get("instruction") or ""
+
+        while iteration < 50:
+            # Step 1: Try to build the project
+            verify_errors = _auto_verify_changed_files(state, all_changed)
+
             if verify_errors:
+                # Build failed — feed errors back to the agent
                 iteration += 1
-                print(f"\n[self-heal] iteration {iteration} — {len(verify_errors)} error(s) found, fixing...", flush=True)
-                _emit_progress(progress_callback, "self_heal", {"iteration": iteration, "errors": len(verify_errors)})
                 error_summary = "\n".join(verify_errors[:5])
+                print(f"\n[self-heal] iteration {iteration} — {len(verify_errors)} error(s), fixing...", flush=True)
+                print(f"  {verify_errors[0][:100]}...", flush=True)
+                _emit_progress(progress_callback, "self_heal", {"iteration": iteration, "errors": len(verify_errors)})
+
                 heal_state = {
                     **state,
+                    "instruction": f"Build errors found. Read the files and fix them:\n{error_summary}",
+                    "_phase_iteration": iteration,
+                    "tool_outputs": [],
+                    "context": {**dict(state.get("context") or {}), "tool_outputs": []},
+                }
+                heal_result = _run_action_plan(
+                    app, heal_state,
+                    _plan_actions_with_cancellation(heal_state),
+                    progress_callback,
+                )
+                new_changed = heal_result.get("changed_files") or []
+                all_changed = list({*all_changed, *new_changed})
+                result = heal_result
+                result["changed_files"] = all_changed
+                _log_rebuild_entry(state, result)
+
+                if not new_changed:
+                    # Agent couldn't fix anything — stop looping
+                    print(f"[self-heal] no changes made, stopping", flush=True)
+                    break
+                continue
+
+            # Step 2: Build passed — check if we should continue with more work
+            if _should_continue_phases(state, result):
+                iteration += 1
+                print(f"\n[continuous] iteration {iteration} — build clean, continuing...", flush=True)
+                _emit_progress(progress_callback, "continuous", {"iteration": iteration})
+
+                next_state = {
+                    **state,
                     "instruction": (
-                        f"The following errors were found after editing. Read the files and fix them:\n{error_summary}"
+                        f"Build is clean. Continue with the next task. "
+                        f"Original instruction: {original_instruction[:200]}"
                     ),
                     "_phase_iteration": iteration,
                     "tool_outputs": [],
-                    "context": {
-                        **dict(state.get("context") or {}),
-                        "tool_outputs": [],
-                    },
+                    "context": {**dict(state.get("context") or {}), "tool_outputs": []},
                 }
-                heal_result = run_once(app, session_store, heal_state, progress_callback)
-                combined_changed = list({
-                    *list(result.get("changed_files") or []),
-                    *list(heal_result.get("changed_files") or []),
-                })
-                heal_result["changed_files"] = combined_changed
-                heal_result["_phase_iteration"] = iteration
-                heal_result["self_heal_iterations"] = iteration
-                return heal_result
+                cont_plan = _plan_actions_with_cancellation(next_state)
+                if not cont_plan.get("actions"):
+                    print(f"[continuous] no more actions planned, done", flush=True)
+                    break
+                cont_result = _run_action_plan(app, next_state, cont_plan, progress_callback)
+                new_changed = cont_result.get("changed_files") or []
+                all_changed = list({*all_changed, *new_changed})
+                result = cont_result
+                result["changed_files"] = all_changed
+                _log_rebuild_entry(state, result)
 
-        # Also support continuous execution for "keep going" / "all phases" instructions
-        if _should_continue_phases(state, result):
-            iteration = state.get("_phase_iteration", 0) + 1
-            print(f"\n[continuous] iteration {iteration} — continuing...", flush=True)
-            _emit_progress(progress_callback, "continuous", {"iteration": iteration})
-            next_state = {
-                **state,
-                "instruction": (
-                    f"Continue where the previous run left off. "
-                    f"The previous run completed {len(changed)} file(s). "
-                    f"Look at what exists and do the next thing needed. "
-                    f"Original instruction: {state.get('request_instruction', state.get('instruction', ''))[:200]}"
-                ),
-                "_phase_iteration": iteration,
-                "tool_outputs": [],
-                "context": {**dict(state.get("context") or {}), "tool_outputs": []},
-            }
-            continuation = run_once(app, session_store, next_state, progress_callback)
-            combined_changed = list({
-                *list(result.get("changed_files") or []),
-                *list(continuation.get("changed_files") or []),
-            })
-            continuation["changed_files"] = combined_changed
-            continuation["_phase_iteration"] = iteration
-            return continuation
+                if not new_changed:
+                    print(f"[continuous] no changes made, done", flush=True)
+                    break
+                continue
 
+            # No errors and no continuation needed — we're done
+            break
+
+        result["_phase_iteration"] = iteration
+        result["self_heal_iterations"] = iteration
         return result
     except PlanningCancelledError:
         result = {
