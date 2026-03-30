@@ -492,21 +492,26 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
     file_line_count = len((current_file_before or "").splitlines())
     planned_mode = preplanned.get("edit_mode") or state.get("edit_mode")
 
+    # Force search_and_replace for ALL edits on existing files.
+    # write_file causes content duplication — the LLM echoes old content + new content.
+    # search_and_replace can only change what it matches, so it's physically safe.
+    # write_file is only allowed for new files (no current content) or broken files (syntax errors).
+    if current_file_before and not syntax_err and planned_mode == "write_file":
+        planned_mode = "search_and_replace"
+
     if syntax_err and file_line_count <= 300:
         hint = (
             "The target file has syntax errors. Use write_file mode. "
-            "The replacement field must contain ONLY the new file content. "
-            "Do NOT include the current file content twice — write it once from scratch."
+            "Write the entire corrected file from scratch in the replacement field."
+        )
+    elif planned_mode == "search_and_replace":
+        hint = (
+            "Use search_and_replace. Set anchor to the EXACT text you want to change "
+            "(copy it verbatim from the current file below). Set replacement to the new text. "
+            "Only the matched text will be changed — everything else stays."
         )
     else:
-        hint = (
-            "Write the REPLACEMENT file content from scratch. "
-            "Do NOT copy-paste or repeat the current file content — it will be replaced entirely. "
-            "The replacement must contain the file ONCE, not the old content plus new content. "
-            "Preserve all existing content — only change what the instruction asks for."
-        )
-
-    # No content loss guard — let write_file do its job.
+        hint = "Write the new file content in the replacement field."
 
     context["helper_notes"] = f"{context.get('helper_notes', '')}\n{hint}".strip()
     seeded_state = {
