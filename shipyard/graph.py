@@ -1513,6 +1513,19 @@ def apply_edit(state: ShipyardState) -> dict:
         updated_content = current_content
 
         if state.get("edit_mode") == "write_file":
+            # Detect and fix content duplication — the LLM sometimes echoes
+            # existing content plus new content, resulting in doubled files.
+            if current_content and replacement and len(replacement) > len(current_content) * 1.5:
+                # Check if replacement is roughly current_content repeated
+                half = len(replacement) // 2
+                first_half = replacement[:half].strip()
+                second_half = replacement[half:].strip()
+                if first_half and second_half and (
+                    first_half == second_half or
+                    current_content.strip() in replacement and replacement.count(current_content.strip()) > 1
+                ):
+                    # Take just the first occurrence
+                    replacement = first_half
             updated_content = replacement
         elif state.get("edit_mode") == "append":
             updated_content = current_content + replacement
