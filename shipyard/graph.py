@@ -936,15 +936,7 @@ def apply_edit(state: ShipyardState) -> dict:
         }
 
     if state.get("edit_mode") in {"run_command", "verify_command", "run_tests"}:
-        # Skip all command execution — these hang on monorepo rebuilds where
-        # dependencies aren't installed. Files are the deliverable, not test results.
         command = str(state.get("command") or "").strip()
-        return {
-            "edit_applied": False,
-            "status": "observed",
-            "no_op": True,
-            "tool_output": {"tool": state.get("edit_mode"), "command": command, "skipped": True, "reason": "Command execution disabled"},
-        }
         if not command:
             return {
                 "edit_applied": False,
@@ -974,7 +966,7 @@ def apply_edit(state: ShipyardState) -> dict:
             text=True,
         )
         cancel_check = state.get("cancel_check")
-        deadline = time.monotonic() + int(state.get("timeout_seconds") or 60)
+        deadline = time.monotonic() + min(int(state.get("timeout_seconds") or 15), 15)
         stdout = ""
         stderr = ""
         returncode = None
@@ -1823,16 +1815,10 @@ def _detect_auto_verification_commands(state: ShipyardState) -> list[str]:
 
 
 def verify_edit(state: ShipyardState) -> dict:
-    # All verification disabled — commands hang on monorepo rebuilds.
-    # Files are the deliverable. Verification happens manually after pnpm install.
-    return {
-        "verification_results": [],
-        "verification_retry_count": int(state.get("verification_retry_count") or 0),
-        "status": state.get("status", "edited"),
-    }
+    # Skip auto-verification (tsc, node --check) — these hang without node_modules.
+    # Only run explicitly requested verification_commands.
     commands = list(state.get("verification_commands") or [])
-    if not commands:
-        commands = _detect_auto_verification_commands(state)
+    # Don't auto-detect — they hang on monorepo rebuilds without node_modules
     if not commands:
         return {
             "verification_results": [],
