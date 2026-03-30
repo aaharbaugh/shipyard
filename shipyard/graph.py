@@ -181,16 +181,12 @@ def _replan_mutate_step_from_current_file(state: ShipyardState, error: str) -> d
     helper_notes = context.get("helper_notes", "")
     syntax_err = _check_file_syntax(str(target))
     file_line_count = len(current_file_before.splitlines())
-    use_rewrite = (state.get("edit_attempts", 0) >= 1 or syntax_err is not None) and file_line_count <= 300
+    # NEVER use write_file as a fallback — it rewrites the whole file and breaks things.
+    # Always use search_and_replace for repairs on existing files.
     repair_note = (
-        "Replan only this failed mutate step from the exact current file contents. "
-        + (
-            "The file has syntax errors or prior edits failed — use write_file mode to rewrite the entire file cleanly. "
-            "Put the complete corrected file content in replacement. "
-            if use_rewrite else
-            "Use a localized edit. Do not trust stale anchors from earlier planning. "
-            "Prefer exact pointers when needed."
-        )
+        "Replan only this failed mutate step. Use search_and_replace mode ONLY. "
+        "Copy the EXACT text you want to change from the current file below as the anchor. "
+        "Do NOT use write_file — it will break other parts of the file."
     )
     context["helper_notes"] = f"{helper_notes}\n{repair_note}\nPrevious error: {error}".strip()
     repaired = propose_edit(
@@ -202,7 +198,7 @@ def _replan_mutate_step_from_current_file(state: ShipyardState, error: str) -> d
     )
     if not repaired.get("is_valid"):
         return None
-    if repaired.get("edit_mode") not in {"anchor", "rename_symbol", "write_file"}:
+    if repaired.get("edit_mode") not in {"anchor", "rename_symbol", "search_and_replace"}:
         return None
     result = {
         "edit_mode": repaired.get("edit_mode"),
@@ -507,7 +503,10 @@ def _refine_preplanned_action(state: ShipyardState, preplanned: dict) -> dict:
         hint = (
             "Use search_and_replace. Set anchor to the EXACT text you want to change "
             "(copy it verbatim from the current file below). Set replacement to the new text. "
-            "Only the matched text will be changed — everything else stays."
+            "ONLY the matched text will be changed — everything else stays UNTOUCHED. "
+            "Do NOT rewrite the whole file. Do NOT add code that already exists. "
+            "Do NOT remove code the instruction didn't ask you to remove. "
+            "If you can't find the exact anchor text, skip this edit — do not guess."
         )
     else:
         hint = "Write the new file content in the replacement field."
