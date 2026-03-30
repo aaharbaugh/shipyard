@@ -670,16 +670,19 @@ def run_once(
                 _log_rebuild_entry(state, result)
 
                 if not new_changed:
-                    # Agent couldn't fix anything this round — try 2 more times
-                    # with increasingly direct instructions before giving up
-                    if iteration % 3 == 0:
-                        print(f"[self-heal] no changes after {iteration} iterations, stopping", flush=True)
-                        break
-                    print(f"[self-heal] no changes, retrying with different approach...", flush=True)
-                continue
+                    # Can't fix these right now — log and move on
+                    skipped = result.get("_skipped_errors") or []
+                    skipped.extend(verify_errors)
+                    result["_skipped_errors"] = skipped
+                    print(f"[self-heal] skipping {len(verify_errors)} unfixable issue(s), continuing...", flush=True)
+                    for e in verify_errors[:3]:
+                        print(f"  NOTED: {e[:80]}", flush=True)
+                    # Don't break — fall through to continuous loop
 
-            # Step 2: Build passed — check if we should continue with more work
-            if _should_continue_phases(state, result):
+            # Step 2: Keep going — always continue if there's more to do
+            has_skipped = bool(result.get("_skipped_errors"))
+            should_continue = _should_continue_phases(state, result) or has_skipped
+            if should_continue:
                 iteration += 1
                 print(f"\n[continuous] iteration {iteration} — build clean, continuing...", flush=True)
                 _emit_progress(progress_callback, "continuous", {"iteration": iteration})
